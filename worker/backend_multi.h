@@ -43,7 +43,10 @@ public:
         // Benchmark each device to determine split ratio
         printf("  [*] Benchmarking devices...\n");
         for (auto& dev : devices_) {
-            dev.rate = dev.backend->benchmark(20000);
+            // Warmup run (Metal needs shader compile + first dispatch)
+            dev.backend->benchmark(5000);
+            // Real benchmark with larger sample
+            dev.rate = dev.backend->benchmark(200000);
             printf("      %s: %llu Keys/s (%.2f MK/s)\n",
                    dev.label.c_str(), (unsigned long long)dev.rate, dev.rate / 1e6);
         }
