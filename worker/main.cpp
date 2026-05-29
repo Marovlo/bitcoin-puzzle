@@ -344,6 +344,7 @@ int main(int argc, char** argv) {
     }
 
     if (!backend->init()) { printf("[!] Backend init failed\n"); return 1; }
+    backend->set_stop_flag(&g_running); // Let backends check for Ctrl+C
 
     printf("=== Bitcoin Puzzle Pool Worker%s ===\n", test_mode ? " (TEST MODE)" : " (Pipeline)");
     printf("  Worker:    %s\n", worker_id.c_str());

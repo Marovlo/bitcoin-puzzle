@@ -88,6 +88,12 @@ private:
     //   2. P[i] = P[i-1] + G for i=1..BATCH_INV_SIZE-1 (incremental!)
     //   3. Batch-invert all Z values (Montgomery trick)
     //   4. Affinize, compress, hash, compare
+    // External stop signal (set by SIGINT handler)
+    static inline std::atomic<bool>* g_stop_flag = nullptr;
+public:
+    void set_stop_flag(std::atomic<bool>* flag) { g_stop_flag = flag; }
+private:
+
     void search_incremental(uint64_t base_lo, uint64_t base_hi,
                             uint64_t offset, uint64_t count,
                             const uint8_t target[20],
@@ -99,7 +105,8 @@ private:
         static const uint64_t* GY = secp256k1::GY;
 
         uint64_t processed = 0;
-        while (processed < count && !found.load(std::memory_order_relaxed)) {
+        while (processed < count && !found.load(std::memory_order_relaxed)
+               && (!g_stop_flag || g_stop_flag->load(std::memory_order_relaxed))) {
             int batch_size = (int)std::min((uint64_t)BATCH_INV_SIZE, count - processed);
 
             // Compute first key in batch via full scalar mul

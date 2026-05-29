@@ -135,6 +135,10 @@ public:
         return total;
     }
 
+    void set_stop_flag(std::atomic<bool>* flag) override {
+        for (auto& dev : devices_) dev.backend->set_stop_flag(flag);
+    }
+
 private:
     struct DeviceSlot {
         std::unique_ptr<ComputeBackend> backend;

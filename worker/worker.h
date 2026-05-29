@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <memory>
+#include <atomic>
 
 // Compute backend interface — all backends implement this
 class ComputeBackend {
@@ -19,6 +20,9 @@ public:
 
     // Keys/second estimate
     virtual uint64_t benchmark(uint64_t sample_size) = 0;
+
+    // Set external stop flag (checked periodically during search)
+    virtual void set_stop_flag(std::atomic<bool>*) {}
 };
 
 // Task from coordinator

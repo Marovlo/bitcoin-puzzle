@@ -9,6 +9,9 @@
 
 class MetalBackend : public ComputeBackend {
 public:
+    static inline std::atomic<bool>* g_stop_flag = nullptr;
+    void set_stop_flag(std::atomic<bool>* flag) { g_stop_flag = flag; }
+
     bool init() override {
         return solver_.init();
     }
@@ -34,6 +37,7 @@ public:
         uint64_t off_hi = start_hi;
 
         while (remaining > 0) {
+            if (g_stop_flag && !g_stop_flag->load(std::memory_order_relaxed)) return false;
             uint64_t bs = std::min(remaining, batch);
             auto result = solver_.search_batch(off_lo, off_hi, bs);
             if (result.found) {
