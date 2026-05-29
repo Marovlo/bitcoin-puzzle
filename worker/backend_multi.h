@@ -29,19 +29,12 @@ public:
             printf("  [+] Metal GPU: available\n");
         }
 #endif
-        // Always add CPU
-        int threads = cpu_threads_;
-#ifdef __APPLE__
-        if (!devices_.empty() && threads == 0) {
-            // If Metal is available and no explicit thread count, use half cores
-            threads = std::max(2, (int)std::thread::hardware_concurrency() / 2);
-        }
-#endif
+        // Always add CPU (default: all cores, user can override with --cpu-threads)
+        int threads = cpu_threads_ > 0 ? cpu_threads_ : (int)std::thread::hardware_concurrency();
         auto cpu = std::make_unique<CPUBackend>(threads);
         if (cpu->init()) {
             devices_.push_back({std::move(cpu), 0, "cpu"});
-            printf("  [+] CPU (%d threads): available\n",
-                   threads > 0 ? threads : (int)std::thread::hardware_concurrency());
+            printf("  [+] CPU (%d threads): available\n", threads);
         }
 
         if (devices_.empty()) return false;
