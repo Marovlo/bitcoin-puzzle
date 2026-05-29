@@ -296,6 +296,8 @@ int main(int argc, char** argv) {
     gethostname(hname, sizeof(hname));
 
     bool test_mode = false;
+    int cpu_threads = 0;        // 0 = auto
+    uint64_t metal_batch = 0;   // 0 = default (4M)
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) && i + 1 < argc)
@@ -304,11 +306,21 @@ int main(int argc, char** argv) {
             backend_name = argv[++i];
         else if (strcmp(argv[i], "--id") == 0 && i + 1 < argc)
             worker_id = argv[++i];
+        else if (strcmp(argv[i], "--cpu-threads") == 0 && i + 1 < argc)
+            cpu_threads = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--metal-batch") == 0 && i + 1 < argc)
+            metal_batch = strtoull(argv[++i], nullptr, 10);
         else if (strcmp(argv[i], "--test") == 0 || strcmp(argv[i], "-t") == 0)
             test_mode = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--url URL] [--backend auto|metal|cpu|cuda] [--id ID] [--test]\n", argv[0]);
-            printf("  --test  Run connectivity + compute + submit test, then exit\n");
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("  -u, --url URL          Coordinator URL (default: http://localhost:8080)\n");
+            printf("  -b, --backend NAME     Backend: auto, metal, cpu, cuda (default: auto)\n");
+            printf("      --id ID            Worker ID (default: random)\n");
+            printf("      --cpu-threads N    CPU thread count (default: all cores)\n");
+            printf("      --metal-batch N    Metal keys per dispatch (default: 4000000)\n");
+            printf("  -t, --test             Run self-test and exit\n");
+            printf("  -h, --help             Show help\n");
             return 0;
         }
     }
@@ -316,15 +328,17 @@ int main(int argc, char** argv) {
     // Init backend
     std::unique_ptr<ComputeBackend> backend;
     if (backend_name == "auto" || backend_name == "multi") {
-        backend = std::make_unique<MultiBackend>();
+        backend = std::make_unique<MultiBackend>(cpu_threads, metal_batch);
     } else if (backend_name == "metal") {
 #ifdef __APPLE__
-        backend = std::make_unique<MetalBackend>();
+        auto m = std::make_unique<MetalBackend>();
+        if (metal_batch > 0) m->set_batch(metal_batch);
+        backend = std::move(m);
 #else
         printf("[!] Metal not available\n"); return 1;
 #endif
     } else if (backend_name == "cpu") {
-        backend = std::make_unique<CPUBackend>();
+        backend = std::make_unique<CPUBackend>(cpu_threads);
     } else {
         printf("[!] Unknown backend: %s\n", backend_name.c_str()); return 1;
     }

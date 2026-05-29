@@ -16,26 +16,32 @@
 // Strategy: split each task proportionally to measured device speeds.
 class MultiBackend : public ComputeBackend {
 public:
+    MultiBackend(int cpu_threads = 0, uint64_t metal_batch = 0)
+        : cpu_threads_(cpu_threads), metal_batch_(metal_batch) {}
+
     bool init() override {
         // Try Metal first (fastest on Apple Silicon)
 #ifdef __APPLE__
         auto metal = std::make_unique<MetalBackend>();
         if (metal->init()) {
+            if (metal_batch_ > 0) metal->set_batch(metal_batch_);
             devices_.push_back({std::move(metal), 0, "metal"});
             printf("  [+] Metal GPU: available\n");
         }
 #endif
-        // Always add CPU (uses threads not used by GPU)
-        // On M-series: GPU uses efficiency cores mostly, so perf cores are free
-        int cpu_threads = (int)std::thread::hardware_concurrency();
+        // Always add CPU
+        int threads = cpu_threads_;
 #ifdef __APPLE__
-        // If Metal is available, use fewer CPU threads (leave some headroom)
-        if (!devices_.empty()) cpu_threads = std::max(2, cpu_threads / 2);
+        if (!devices_.empty() && threads == 0) {
+            // If Metal is available and no explicit thread count, use half cores
+            threads = std::max(2, (int)std::thread::hardware_concurrency() / 2);
+        }
 #endif
-        auto cpu = std::make_unique<CPUBackend>(cpu_threads);
+        auto cpu = std::make_unique<CPUBackend>(threads);
         if (cpu->init()) {
             devices_.push_back({std::move(cpu), 0, "cpu"});
-            printf("  [+] CPU (%d threads): available\n", cpu_threads);
+            printf("  [+] CPU (%d threads): available\n",
+                   threads > 0 ? threads : (int)std::thread::hardware_concurrency());
         }
 
         if (devices_.empty()) return false;
@@ -136,4 +142,6 @@ private:
         std::string label;
     };
     std::vector<DeviceSlot> devices_;
+    int cpu_threads_;
+    uint64_t metal_batch_;
 };

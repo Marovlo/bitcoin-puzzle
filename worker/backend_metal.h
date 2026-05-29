@@ -17,6 +17,10 @@ public:
         return "metal_" + solver_.device_name();
     }
 
+    void set_batch(uint64_t batch_size) {
+        solver_.set_batch_size(batch_size);
+    }
+
     bool search(uint64_t start_lo, uint64_t start_hi, uint64_t size,
                 const uint8_t target_h160[20],
                 uint64_t& found_lo, uint64_t& found_hi) override {
