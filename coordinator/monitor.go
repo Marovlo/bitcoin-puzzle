@@ -24,6 +24,14 @@ func NewPuzzleMonitor(coord *Coordinator, emailTo string) *PuzzleMonitor {
 }
 
 func (m *PuzzleMonitor) Start() {
+	// Send startup test email
+	stats := m.coord.getStats()
+	m.sendEmail(
+		fmt.Sprintf("[Puzzle Pool] Coordinator started - targeting #%d", stats.PuzzleNum),
+		fmt.Sprintf("Coordinator is online.\n\nPuzzle: #%d\nAddress: %s\nChunk size: 2^%d\nTotal chunks: %s\nStarted at: %s",
+			stats.PuzzleNum, stats.Address, stats.ChunkBits,
+			stats.TotalChunks, time.Now().UTC().Format("2006-01-02 15:04:05 UTC")))
+
 	go m.monitorLoop()
 	go m.dailyReportLoop()
 	log.Printf("[Monitor] Started: check every 1h, email=%s", m.emailTo)
