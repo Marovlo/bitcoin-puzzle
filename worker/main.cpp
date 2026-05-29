@@ -205,41 +205,48 @@ static void submit_thread_fn(const std::string& base_url, const std::string& wor
                              std::atomic<uint64_t>& tasks_submitted) {
     std::vector<ComputeResult> batch;
 
-    while (g_running || result_queue.size() > 0) {
+    while (true) {
         ComputeResult r;
-        if (!result_queue.pop(r, 500)) {
-            // Timeout: flush what we have
+        bool got = result_queue.pop(r, 500);
+
+        if (!got) {
+            // Timeout: flush accumulated batch
             if (!batch.empty()) goto flush;
+            // If shutting down and queue is empty, we're done
+            if (!g_running && result_queue.size() == 0) break;
             continue;
         }
         batch.push_back(r);
 
-        // Accumulate up to 10 or flush if found
+        // Flush when batch full or key found
         if (batch.size() >= 10 || r.found) {
             goto flush;
         }
         continue;
 
     flush:
-        // Build JSON
-        std::string json_str = "{\"worker_id\":\"" + worker_id + "\",\"results\":[";
-        for (size_t i = 0; i < batch.size(); i++) {
-            if (i > 0) json_str += ",";
-            char buf[256];
-            snprintf(buf, sizeof(buf), "{\"task_id\":%lld,\"found\":%s,\"key_hex\":\"%s\"}",
-                     (long long)batch[i].task_id,
-                     batch[i].found ? "true" : "false",
-                     batch[i].key_hex.c_str());
-            json_str += buf;
+        {
+            std::string json_str = "{\"worker_id\":\"" + worker_id + "\",\"results\":[";
+            for (size_t i = 0; i < batch.size(); i++) {
+                if (i > 0) json_str += ",";
+                char buf[256];
+                snprintf(buf, sizeof(buf), "{\"task_id\":%lld,\"found\":%s,\"key_hex\":\"%s\"}",
+                         (long long)batch[i].task_id,
+                         batch[i].found ? "true" : "false",
+                         batch[i].key_hex.c_str());
+                json_str += buf;
+            }
+            json_str += "]}";
+            http::post(base_url + "/api/submit", json_str);
+            tasks_submitted.fetch_add(batch.size());
+            batch.clear();
         }
-        json_str += "]}";
 
-        http::post(base_url + "/api/submit", json_str);
-        tasks_submitted.fetch_add(batch.size());
-        batch.clear();
+        // After flush, check if we should exit
+        if (!g_running && result_queue.size() == 0) break;
     }
 
-    // Final flush
+    // Final flush of any remaining
     if (!batch.empty()) {
         std::string json_str = "{\"worker_id\":\"" + worker_id + "\",\"results\":[";
         for (size_t i = 0; i < batch.size(); i++) {
@@ -410,10 +417,18 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Shutdown
+    // Graceful shutdown: ensure all completed results are uploaded
     g_running = false;
+    printf("\n[*] Shutting down... flushing pending results\n");
+
+    // Wait for fetch thread to stop (it checks g_running)
     fetcher.join();
+
+    // Submit thread will drain result_queue until empty, then exit
+    // (its loop condition: `g_running || result_queue.size() > 0`)
     submitter.join();
+
+    printf("[+] All completed tasks submitted to coordinator\n");
 
     auto t_end = std::chrono::steady_clock::now();
     double total_time = std::chrono::duration<double>(t_end - t_start).count();
