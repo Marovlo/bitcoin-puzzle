@@ -272,7 +272,23 @@ inline void ripemd160_32(thread const uchar sha[32], thread uchar h160[20]) {
     for(int i=0;i<5;i++){h160[i*4]=(uchar)Hf[i];h160[i*4+1]=(uchar)(Hf[i]>>8);h160[i*4+2]=(uchar)(Hf[i]>>16);h160[i*4+3]=(uchar)(Hf[i]>>24);}
 }
 
-// === Main kernel ===
+// === Main kernel (OPTIMIZED: incremental search) ===
+// Each thread processes KEYS_PER_THREAD consecutive keys.
+// Thread `gid` handles keys: [start + gid*KPT, start + gid*KPT + KPT)
+// First key: full scalar_mul_g (windowed table)
+// Subsequent keys: P[i+1] = P[i] + G (one point_add_mixed, ~30x cheaper)
+//
+// The expensive mod_inv is still per-key (GPU batch inversion would require
+// threadgroup cooperation). But the scalar_mul savings dominate.
+
+constant uint KEYS_PER_THREAD = 8u; // 8 balances register pressure vs scalar_mul savings
+
+// Generator G in affine (hardcoded to avoid table lookup)
+constant ulong GX_C[4] = {0x59F2815B16F81798ul, 0x029BFCDB2DCE28D9ul,
+                           0x55A06295CE870B07ul, 0x79BE667EF9DCBBACul};
+constant ulong GY_C[4] = {0x9C47D08FFB10D4B8ul, 0xFD17B448A6855419ul,
+                           0x5DA4FBFC0E1108A8ul, 0x483ADA7726A3C465ul};
+
 kernel void puzzle_search(
     device const ulong*       g_table      [[buffer(0)]],
     device const uchar*       target_h160  [[buffer(1)]],
@@ -284,53 +300,80 @@ kernel void puzzle_search(
     device       atomic_uint* match_found  [[buffer(7)]],
     uint                      gid          [[thread_position_in_grid]])
 {
-    if ((ulong)gid >= total_keys) return;
+    ulong first_key_idx = (ulong)gid * KEYS_PER_THREAD;
+    if (first_key_idx >= total_keys) return;
     if (atomic_load_explicit(match_found, memory_order_relaxed) != 0u) return;
 
-    // k = start + gid
+    uint keys_this_thread = KEYS_PER_THREAD;
+    if (first_key_idx + keys_this_thread > total_keys)
+        keys_this_thread = (uint)(total_keys - first_key_idx);
+
+    // Compute first key: k0 = start + first_key_idx
     ulong k[4];
     ulong c = 0;
-    k[0] = addc(start_lo, (ulong)gid, c);
+    k[0] = addc(start_lo, first_key_idx, c);
     k[1] = addc(start_hi, 0, c);
     k[2] = c;
     k[3] = 0;
 
-    // P = k * G
+    // P0 = k0 * G via windowed table (expensive, but only once per thread)
     ulong px[4], py[4], pz[4];
     scalar_mul_g(px, py, pz, k, g_table);
-    if (limbs_zero(pz)) return;
 
-    // Affinize
-    ulong zi[4], zi2[4], zi3[4], ax[4], ay[4];
-    mod_inv(zi, pz);
-    mod_sqr(zi2, zi);
-    mod_mul(zi3, zi2, zi);
-    mod_mul(ax, px, zi2);
-    mod_mul(ay, py, zi3);
+    // Process each key in the thread's range
+    for (uint i = 0; i < keys_this_thread; i++) {
+        if (atomic_load_explicit(match_found, memory_order_relaxed) != 0u) return;
 
-    // Compress pubkey
-    uchar pubkey[33];
-    pubkey[0] = (uchar)(0x02u | (uint)(ay[0] & 1ul));
-    for (int i = 0; i < 4; ++i) {
-        ulong l = ax[3-i];
-        for (int j = 0; j < 8; ++j) pubkey[1+i*8+j] = (uchar)(l >> (56-8*j));
-    }
+        if (!limbs_zero(pz)) {
+            // Affinize (still per-key mod_inv - major cost, but fewer scalar_muls)
+            ulong zi[4], zi2[4], zi3[4], ax[4], ay[4];
+            mod_inv(zi, pz);
+            mod_sqr(zi2, zi);
+            mod_mul(zi3, zi2, zi);
+            mod_mul(ax, px, zi2);
+            mod_mul(ay, py, zi3);
 
-    // SHA256 + RIPEMD160
-    uchar sha[32], h160[20];
-    sha256_33(pubkey, sha);
-    ripemd160_32(sha, h160);
+            // Compress pubkey
+            uchar pubkey[33];
+            pubkey[0] = (uchar)(0x02u | (uint)(ay[0] & 1ul));
+            for (int j = 0; j < 4; ++j) {
+                ulong l = ax[3-j];
+                for (int b = 0; b < 8; ++b) pubkey[1+j*8+b] = (uchar)(l >> (56-8*b));
+            }
 
-    // Compare
-    bool match = true;
-    for (int i = 0; i < 20; ++i) { if (h160[i] != target_h160[i]) { match = false; break; } }
+            // SHA256 + RIPEMD160
+            uchar sha[32], h160[20];
+            sha256_33(pubkey, sha);
+            ripemd160_32(sha, h160);
 
-    if (match) {
-        uint expected = 0u;
-        if (atomic_compare_exchange_weak_explicit(match_found, &expected, 1u,
-                memory_order_relaxed, memory_order_relaxed)) {
-            match_lo[0] = k[0];
-            match_hi[0] = k[1];
+            // Compare (early exit on first mismatch byte)
+            bool match = true;
+            for (int j = 0; j < 20; ++j) {
+                if (h160[j] != target_h160[j]) { match = false; break; }
+            }
+
+            if (match) {
+                ulong mk[4];
+                ulong mc = 0;
+                mk[0] = addc(start_lo, first_key_idx + (ulong)i, mc);
+                mk[1] = addc(start_hi, 0, mc);
+                uint expected = 0u;
+                if (atomic_compare_exchange_weak_explicit(match_found, &expected, 1u,
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    match_lo[0] = mk[0];
+                    match_hi[0] = mk[1];
+                }
+                return;
+            }
+        }
+
+        // Increment: P = P + G (for next key, cheap mixed addition)
+        if (i + 1 < keys_this_thread) {
+            ulong nx[4], ny[4], nz[4];
+            ulong gx[4] = {GX_C[0], GX_C[1], GX_C[2], GX_C[3]};
+            ulong gy[4] = {GY_C[0], GY_C[1], GY_C[2], GY_C[3]};
+            jac_add_mixed(nx, ny, nz, px, py, pz, gx, gy);
+            for(int j=0;j<4;j++){px[j]=nx[j];py[j]=ny[j];pz[j]=nz[j];}
         }
     }
 }
