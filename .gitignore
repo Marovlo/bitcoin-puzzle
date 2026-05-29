@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.a
+puzzle_worker
+puzzle_coordinator
+puzzle_solver
+verify_correctness
+puzzle_metal_source.inc
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.codebuddy/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
