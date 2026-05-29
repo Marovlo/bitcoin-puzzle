@@ -295,6 +295,8 @@ int main(int argc, char** argv) {
     char hname[256] = "unknown";
     gethostname(hname, sizeof(hname));
 
+    bool test_mode = false;
+
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) && i + 1 < argc)
             coordinator_url = argv[++i];
@@ -302,8 +304,11 @@ int main(int argc, char** argv) {
             backend_name = argv[++i];
         else if (strcmp(argv[i], "--id") == 0 && i + 1 < argc)
             worker_id = argv[++i];
+        else if (strcmp(argv[i], "--test") == 0 || strcmp(argv[i], "-t") == 0)
+            test_mode = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--url URL] [--backend auto|metal|cpu|cuda] [--id ID]\n", argv[0]);
+            printf("Usage: %s [--url URL] [--backend auto|metal|cpu|cuda] [--id ID] [--test]\n", argv[0]);
+            printf("  --test  Run connectivity + compute + submit test, then exit\n");
             return 0;
         }
     }
@@ -326,7 +331,7 @@ int main(int argc, char** argv) {
 
     if (!backend->init()) { printf("[!] Backend init failed\n"); return 1; }
 
-    printf("=== Bitcoin Puzzle Pool Worker (Pipeline) ===\n");
+    printf("=== Bitcoin Puzzle Pool Worker%s ===\n", test_mode ? " (TEST MODE)" : " (Pipeline)");
     printf("  Worker:    %s\n", worker_id.c_str());
     printf("  Backend:   %s\n", backend->name().c_str());
     printf("  Server:    %s\n", coordinator_url.c_str());
@@ -334,6 +339,119 @@ int main(int argc, char** argv) {
     // Benchmark
     uint64_t rate = backend->benchmark(50000);
     printf("  Speed:     %.2f MKeys/s\n", rate / 1e6);
+
+    // ========== TEST MODE ==========
+    if (test_mode) {
+        printf("\n--- Self-Test ---\n");
+        int pass = 0, fail = 0;
+
+        // Test 1: Health check
+        printf("[1/5] Health check... ");
+        {
+            auto resp = http::get(coordinator_url + "/health");
+            if (resp.ok()) { printf("OK\n"); pass++; }
+            else { printf("FAIL (status=%d)\n", resp.status_code); fail++; }
+        }
+
+        // Test 2: Register
+        printf("[2/5] Register... ");
+        {
+            char buf[512];
+            snprintf(buf, sizeof(buf), R"({"worker_id":"%s","backend":"%s","hostname":"%s","rate":%llu})",
+                     worker_id.c_str(), backend->name().c_str(), hname, (unsigned long long)rate);
+            auto resp = http::post(coordinator_url + "/api/register", buf);
+            if (resp.ok()) { printf("OK\n"); pass++; }
+            else { printf("FAIL (status=%d body=%s)\n", resp.status_code, resp.body.c_str()); fail++; }
+        }
+
+        // Test 3: Get task
+        printf("[3/5] Get task... ");
+        int64_t task_id = 0;
+        uint64_t task_start_lo = 0, task_start_hi = 0, task_size = 0;
+        std::string target_h160_hex;
+        {
+            char url[512];
+            snprintf(url, sizeof(url), "%s/api/tasks?worker_id=%s&count=1", coordinator_url.c_str(), worker_id.c_str());
+            auto resp = http::get(url);
+            if (!resp.ok()) {
+                printf("FAIL (status=%d)\n", resp.status_code); fail++;
+            } else {
+                std::string err = json::get_string(resp.body, "error");
+                if (!err.empty()) {
+                    printf("FAIL (error=%s)\n", err.c_str()); fail++;
+                } else {
+                    target_h160_hex = json::get_string(resp.body, "target_h160");
+                    auto tasks_pos = resp.body.find("\"tasks\"");
+                    auto arr_start = resp.body.find('[', tasks_pos);
+                    auto obj_start = resp.body.find('{', arr_start);
+                    int depth = 0; size_t obj_end = obj_start;
+                    for (size_t x = obj_start; x < resp.body.size(); x++) {
+                        if (resp.body[x] == '{') depth++;
+                        else if (resp.body[x] == '}') { depth--; if (depth==0) { obj_end=x; break; } }
+                    }
+                    std::string tj = resp.body.substr(obj_start, obj_end - obj_start + 1);
+                    task_id = json::get_int(tj, "id");
+                    task_size = json::get_uint(tj, "size");
+                    std::string sh = json::get_string(tj, "start_hex");
+                    parse_hex_key(sh, task_start_hi, task_start_lo);
+                    printf("OK (task_id=%lld, size=%llu, target=%s)\n",
+                           (long long)task_id, (unsigned long long)task_size,
+                           target_h160_hex.substr(0, 8).c_str());
+                    pass++;
+                }
+            }
+        }
+
+        // Test 4: Compute (small sample)
+        printf("[4/5] Compute (10K keys)... ");
+        if (task_size > 0 && !target_h160_hex.empty()) {
+            uint8_t target[20];
+            hex_to_bytes(target_h160_hex, target, 20);
+            uint64_t fl = 0, fh = 0;
+            auto t0 = std::chrono::steady_clock::now();
+            // Only compute 10K keys (not the full chunk) for speed
+            backend->search(task_start_lo, task_start_hi, 10000, target, fl, fh);
+            auto t1 = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(t1 - t0).count();
+            printf("OK (%.3fs, %.1f MK/s)\n", elapsed, 10000.0 / elapsed / 1e6);
+            pass++;
+        } else {
+            printf("SKIP (no task)\n");
+        }
+
+        // Test 5: Submit result
+        printf("[5/5] Submit... ");
+        if (task_id > 0) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     R"({"worker_id":"%s","results":[{"task_id":%lld,"found":false,"key_hex":""}]})",
+                     worker_id.c_str(), (long long)task_id);
+            auto resp = http::post(coordinator_url + "/api/submit", buf);
+            if (resp.ok() && resp.body.find("\"ok\"") != std::string::npos) {
+                printf("OK (response: %s)\n", resp.body.c_str());
+                pass++;
+            } else {
+                printf("FAIL (status=%d body=%s)\n", resp.status_code, resp.body.c_str());
+                fail++;
+            }
+        } else {
+            printf("SKIP (no task)\n");
+        }
+
+        // Verify coordinator recorded it
+        printf("\n--- Verify ---\n");
+        {
+            auto resp = http::get(coordinator_url + "/api/stats");
+            if (resp.ok()) {
+                printf("  Stats: %s\n", resp.body.c_str());
+            }
+        }
+
+        printf("\n--- Result: %d passed, %d failed ---\n", pass, fail);
+        return fail > 0 ? 1 : 0;
+    }
+
+    // ========== NORMAL MODE (Pipeline) ==========
 
     // Register
     {
