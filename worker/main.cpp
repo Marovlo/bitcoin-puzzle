@@ -237,8 +237,15 @@ static void submit_thread_fn(const std::string& base_url, const std::string& wor
                 json_str += buf;
             }
             json_str += "]}";
-            http::post(base_url + "/api/submit", json_str);
-            tasks_submitted.fetch_add(batch.size());
+            auto resp = http::post(base_url + "/api/submit", json_str);
+            if (resp.ok()) {
+                tasks_submitted.fetch_add(batch.size());
+                printf("  [submit] %zu tasks uploaded OK\n", batch.size());
+            } else {
+                printf("  [submit] FAILED (status=%d), will retry\n", resp.status_code);
+                // On failure, DON'T clear batch — retry on next loop
+                continue;
+            }
             batch.clear();
         }
 
@@ -246,21 +253,29 @@ static void submit_thread_fn(const std::string& base_url, const std::string& wor
         if (!g_running && result_queue.size() == 0) break;
     }
 
-    // Final flush of any remaining
+    // Final flush of any remaining (with retry)
     if (!batch.empty()) {
-        std::string json_str = "{\"worker_id\":\"" + worker_id + "\",\"results\":[";
-        for (size_t i = 0; i < batch.size(); i++) {
-            if (i > 0) json_str += ",";
-            char buf[256];
-            snprintf(buf, sizeof(buf), "{\"task_id\":%lld,\"found\":%s,\"key_hex\":\"%s\"}",
-                     (long long)batch[i].task_id,
-                     batch[i].found ? "true" : "false",
-                     batch[i].key_hex.c_str());
-            json_str += buf;
+        for (int retry = 0; retry < 3; retry++) {
+            std::string json_str = "{\"worker_id\":\"" + worker_id + "\",\"results\":[";
+            for (size_t i = 0; i < batch.size(); i++) {
+                if (i > 0) json_str += ",";
+                char buf[256];
+                snprintf(buf, sizeof(buf), "{\"task_id\":%lld,\"found\":%s,\"key_hex\":\"%s\"}",
+                         (long long)batch[i].task_id,
+                         batch[i].found ? "true" : "false",
+                         batch[i].key_hex.c_str());
+                json_str += buf;
+            }
+            json_str += "]}";
+            auto resp = http::post(base_url + "/api/submit", json_str);
+            if (resp.ok()) {
+                tasks_submitted.fetch_add(batch.size());
+                printf("  [submit] Final flush: %zu tasks uploaded OK\n", batch.size());
+                break;
+            }
+            printf("  [submit] Final flush retry %d/3 failed\n", retry + 1);
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-        json_str += "]}";
-        http::post(base_url + "/api/submit", json_str);
-        tasks_submitted.fetch_add(batch.size());
     }
 }
 
@@ -421,11 +436,14 @@ int main(int argc, char** argv) {
     g_running = false;
     printf("\n[*] Shutting down... flushing pending results\n");
 
-    // Wait for fetch thread to stop (it checks g_running)
-    fetcher.join();
+    // Give submit thread time to drain result_queue
+    for (int i = 0; i < 20 && result_queue.size() > 0; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
 
-    // Submit thread will drain result_queue until empty, then exit
-    // (its loop condition: `g_running || result_queue.size() > 0`)
+    // Wait for fetch thread to stop
+    fetcher.join();
+    // Wait for submit thread to finish flushing
     submitter.join();
 
     printf("[+] All completed tasks submitted to coordinator\n");
