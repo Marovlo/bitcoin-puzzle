@@ -30,8 +30,9 @@ if(USE_CUDA)
         kernels/cuda/cuda_solver.cu
     )
     # CUDA architecture (tune for your GPU)
+    # 75=Turing(2070), 86=Ampere(3070), 89=Ada(4090), 90=Hopper(H20/H100)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "75;86;89") # Turing, Ampere, Ada
+        set(CMAKE_CUDA_ARCHITECTURES "86;89;90")
     endif()
 endif()
 

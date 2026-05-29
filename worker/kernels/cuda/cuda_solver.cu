@@ -58,9 +58,11 @@ bool CUDASolver::init(int device_id) {
     cudaGetDeviceProperties(&prop, device_id);
     impl_->device_name_str = prop.name;
 
-    // Optimal launch config
+    // Optimal launch config: 256 threads/block, 4 blocks/SM
     impl_->threads_per_block = 256;
-    impl_->blocks = prop.multiProcessorCount * 4; // Good occupancy
+    impl_->blocks = prop.multiProcessorCount * 4;
+    // Default batch: fill all SMs generously (16M keys for H20/H100)
+    impl_->batch = (uint64_t)impl_->blocks * impl_->threads_per_block * 4; // ~16M for H20
 
     printf("[CUDA] Device: %s (SM %d.%d, %d SMs, %d MB)\n",
            prop.name, prop.major, prop.minor,
