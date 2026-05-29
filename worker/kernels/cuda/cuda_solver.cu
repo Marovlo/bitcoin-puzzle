@@ -110,8 +110,8 @@ bool CUDASolver::search_batch(uint64_t start_lo, uint64_t start_hi, uint64_t bat
     cudaMemcpy(impl_->d_match_hi, &zero64, sizeof(uint64_t), cudaMemcpyHostToDevice);
     cudaMemcpy(impl_->d_match_found, &zero32, sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-    // Launch kernel
-    int threads = impl_->threads_per_block;
+    // Launch kernel: each block handles 256 consecutive keys (batch inversion)
+    int threads = 256; // must match BLOCK_SIZE in kernel
     int blocks = (int)((batch_size + threads - 1) / threads);
 
     puzzle_search<<<blocks, threads>>>(
