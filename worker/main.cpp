@@ -33,7 +33,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <unistd.h>
+#include "platform.h"
 
 // ========== Thread-safe queue ==========
 
@@ -293,7 +293,7 @@ int main(int argc, char** argv) {
     snprintf(id_buf, sizeof(id_buf), "w_%08x", (unsigned)rand());
     std::string worker_id = id_buf;
     char hname[256] = "unknown";
-    gethostname(hname, sizeof(hname));
+    gethostname_compat(hname, sizeof(hname));
 
     bool test_mode = false;
     int cpu_threads = 0;        // 0 = auto

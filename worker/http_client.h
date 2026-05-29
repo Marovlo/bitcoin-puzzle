@@ -2,12 +2,8 @@
 #include <string>
 #include <cstring>
 #include <cstdio>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <poll.h>
+#include <cstdlib>
+#include "platform.h"
 
 namespace http {
 
