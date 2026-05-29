@@ -234,6 +234,7 @@ func (c *Coordinator) isChunkAvailable(idx uint64) bool {
 }
 
 // allocateChunks picks N random available chunk indices and assigns them.
+// Priority: 1) reclaim stale tasks first, 2) random new chunks.
 // Holds the mutex for the entire operation to guarantee no duplicates.
 func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error) {
 	c.mu.Lock()
@@ -242,12 +243,33 @@ func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error)
 	now := time.Now().Unix()
 	c.workers[workerID] = time.Now()
 
-	totalU64 := c.totalChunks.Uint64() // safe for puzzles up to ~93 bits of chunks
-	// For puzzles where totalChunks > 2^63, we use big.Int random
-	useBigRand := !c.totalChunks.IsUint64()
-
 	var tasks []Task
-	maxAttempts := count * 50 // up to 50 retries per requested task
+
+	// Priority 1: reclaim stale tasks (worker died without completing)
+	staleRows, err := c.db.Query(
+		`SELECT id, chunk_index, start_hex, size FROM active_tasks WHERE worker_id='__stale__' LIMIT ?`, count)
+	if err == nil {
+		defer staleRows.Close()
+		for staleRows.Next() && len(tasks) < count {
+			var t Task
+			staleRows.Scan(&t.ID, &t.ChunkIndex, &t.StartHex, &t.Size)
+			c.db.Exec(`UPDATE active_tasks SET worker_id=?, assigned_at=? WHERE id=?`, workerID, now, t.ID)
+			t.WorkerID = workerID
+			t.AssignedAt = now
+			t.Status = 1
+			tasks = append(tasks, t)
+		}
+	}
+
+	if len(tasks) >= count {
+		return tasks, nil
+	}
+
+	// Priority 2: random new chunks
+	totalU64 := c.totalChunks.Uint64()
+	useBigRand := !c.totalChunks.IsUint64()
+	remaining := count - len(tasks)
+	maxAttempts := remaining * 50
 
 	for i := 0; i < maxAttempts && len(tasks) < count; i++ {
 		var idx uint64
@@ -267,7 +289,6 @@ func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error)
 			continue
 		}
 
-		// Compute start key
 		offset := new(big.Int).SetUint64(idx)
 		offset.Mul(offset, new(big.Int).SetUint64(c.chunkSize))
 		startKey := new(big.Int).Add(c.rangeStart, offset)
@@ -275,11 +296,11 @@ func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error)
 
 		res, err := c.stmtInsertTask.Exec(idx, startHex, c.chunkSize, workerID, now)
 		if err != nil {
-			continue // race condition, another goroutine got it
+			continue
 		}
 		rows, _ := res.RowsAffected()
 		if rows == 0 {
-			continue // UNIQUE violation, already assigned
+			continue
 		}
 		id, _ := res.LastInsertId()
 		tasks = append(tasks, Task{
@@ -288,34 +309,6 @@ func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error)
 		})
 	}
 
-	if len(tasks) == 0 {
-		// Try to reclaim stale tasks
-		return c.reclaimStale(workerID, count)
-	}
-	return tasks, nil
-}
-
-func (c *Coordinator) reclaimStale(workerID string, count int) ([]Task, error) {
-	now := time.Now().Unix()
-	rows, err := c.db.Query(
-		`SELECT id, chunk_index, start_hex, size FROM active_tasks WHERE worker_id='__stale__' LIMIT ?`,
-		count)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tasks []Task
-	for rows.Next() {
-		var t Task
-		rows.Scan(&t.ID, &t.ChunkIndex, &t.StartHex, &t.Size)
-		c.db.Exec(`UPDATE active_tasks SET worker_id=?, assigned_at=? WHERE id=?`,
-			workerID, now, t.ID)
-		t.WorkerID = workerID
-		t.AssignedAt = now
-		t.Status = 1
-		tasks = append(tasks, t)
-	}
 	if len(tasks) == 0 {
 		return nil, fmt.Errorf("no tasks available")
 	}
