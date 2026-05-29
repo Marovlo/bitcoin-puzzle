@@ -129,9 +129,10 @@ func NewCoordinator(dbPath string, puzzles []PuzzleEntry, puzzleNum, chunkBits i
 	if err != nil {
 		return nil, err
 	}
-	// Connection pool settings for concurrency
-	db.SetMaxOpenConns(1) // SQLite only supports 1 writer anyway
-	db.SetMaxIdleConns(1)
+	// Connection pool: SQLite supports 1 writer but multiple readers.
+	// Set to 2 to avoid deadlock when Query rows are open during Exec.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 
 	c := &Coordinator{
 		db:        db,
@@ -246,19 +247,32 @@ func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error)
 	var tasks []Task
 
 	// Priority 1: reclaim stale tasks (worker died without completing)
+	// IMPORTANT: Read all rows first, then close, then update.
+	// With MaxOpenConns=1, an open Rows blocks all other SQL operations.
+	type staleRow struct {
+		id         int64
+		chunkIndex uint64
+		startHex   string
+		size       uint64
+	}
+	var staleList []staleRow
 	staleRows, err := c.db.Query(
 		`SELECT id, chunk_index, start_hex, size FROM active_tasks WHERE worker_id='__stale__' LIMIT ?`, count)
 	if err == nil {
-		defer staleRows.Close()
-		for staleRows.Next() && len(tasks) < count {
-			var t Task
-			staleRows.Scan(&t.ID, &t.ChunkIndex, &t.StartHex, &t.Size)
-			c.db.Exec(`UPDATE active_tasks SET worker_id=?, assigned_at=? WHERE id=?`, workerID, now, t.ID)
-			t.WorkerID = workerID
-			t.AssignedAt = now
-			t.Status = 1
-			tasks = append(tasks, t)
+		for staleRows.Next() {
+			var s staleRow
+			staleRows.Scan(&s.id, &s.chunkIndex, &s.startHex, &s.size)
+			staleList = append(staleList, s)
 		}
+		staleRows.Close() // Release connection BEFORE doing updates
+	}
+
+	for _, s := range staleList {
+		c.db.Exec(`UPDATE active_tasks SET worker_id=?, assigned_at=? WHERE id=?`, workerID, now, s.id)
+		tasks = append(tasks, Task{
+			ID: s.id, ChunkIndex: s.chunkIndex, StartHex: s.startHex,
+			Size: s.size, Status: 1, WorkerID: workerID, AssignedAt: now,
+		})
 	}
 
 	if len(tasks) >= count {
