@@ -4,6 +4,12 @@
 #ifdef __APPLE__
 #include "backend_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "backend_cuda.h"
+#endif
+#ifdef USE_HIP
+#include "backend_hip.h"
+#endif
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -20,16 +26,39 @@ public:
         : cpu_threads_(cpu_threads), metal_batch_(metal_batch) {}
 
     bool init() override {
-        // Try Metal first (fastest on Apple Silicon)
-#ifdef __APPLE__
-        auto metal = std::make_unique<MetalBackend>();
-        if (metal->init()) {
-            if (metal_batch_ > 0) metal->set_batch(metal_batch_);
-            devices_.push_back({std::move(metal), 0, "metal"});
-            printf("  [+] Metal GPU: available\n");
+        // Priority: CUDA > HIP > Metal > CPU
+
+#ifdef USE_CUDA
+        {
+            auto cuda = std::make_unique<CUDABackend>(0, metal_batch_);
+            if (cuda->init()) {
+                devices_.push_back({std::move(cuda), 0, "cuda"});
+                printf("  [+] CUDA GPU: available\n");
+            }
         }
 #endif
-        // Always add CPU (default: all cores, user can override with --cpu-threads)
+
+#ifdef USE_HIP
+        {
+            auto hip = std::make_unique<HIPBackend>(0);
+            if (hip->init()) {
+                devices_.push_back({std::move(hip), 0, "hip"});
+                printf("  [+] HIP GPU: available\n");
+            }
+        }
+#endif
+
+#ifdef __APPLE__
+        {
+            auto metal = std::make_unique<MetalBackend>();
+            if (metal->init()) {
+                if (metal_batch_ > 0) metal->set_batch(metal_batch_);
+                devices_.push_back({std::move(metal), 0, "metal"});
+                printf("  [+] Metal GPU: available\n");
+            }
+        }
+#endif
+        // Always add CPU
         int threads = cpu_threads_ > 0 ? cpu_threads_ : (int)std::thread::hardware_concurrency();
         auto cpu = std::make_unique<CPUBackend>(threads);
         if (cpu->init()) {

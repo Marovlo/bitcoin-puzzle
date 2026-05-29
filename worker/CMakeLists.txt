@@ -18,7 +18,6 @@ if(USE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
-    add_definitions(-DUSE_CUDA)
 endif()
 
 # HIP/ROCm support (optional)
@@ -27,7 +26,6 @@ if(USE_HIP)
     enable_language(HIP)
     find_package(hip REQUIRED)
     message(STATUS "HIP found")
-    add_definitions(-DUSE_HIP)
 endif()
 
 # Sources
@@ -93,10 +91,12 @@ target_link_libraries(puzzle_worker Threads::Threads)
 find_package(Threads REQUIRED)
 
 if(USE_CUDA)
+    target_compile_definitions(puzzle_worker PRIVATE USE_CUDA)
     target_link_libraries(puzzle_worker CUDA::cudart)
 endif()
 
 if(USE_HIP)
+    target_compile_definitions(puzzle_worker PRIVATE USE_HIP)
     target_link_libraries(puzzle_worker hip::device)
 endif()
 
