@@ -51,7 +51,10 @@ public:
     }
 
     uint64_t benchmark(uint64_t sample_size) override {
-        auto result = solver_.benchmark(sample_size);
+        // Metal GPU needs large batches to saturate. Use at least 4M keys
+        // (one full dispatch) for accurate measurement.
+        uint64_t actual = std::max(sample_size, (uint64_t)4'000'000);
+        auto result = solver_.benchmark(actual);
         return (uint64_t)result.keys_per_second;
     }
 
