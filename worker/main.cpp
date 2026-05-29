@@ -282,6 +282,7 @@ static void submit_thread_fn(const std::string& base_url, const std::string& wor
 // ========== Main ==========
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0); // Line-buffered output (for nohup/redirect)
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
