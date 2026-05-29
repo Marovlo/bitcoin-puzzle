@@ -13,12 +13,21 @@ elseif(WIN32 OR UNIX)
 endif()
 
 # CUDA support (optional)
-option(USE_CUDA "Enable CUDA GPU support" OFF)
+option(USE_CUDA "Enable NVIDIA CUDA support" OFF)
 if(USE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
     add_definitions(-DUSE_CUDA)
+endif()
+
+# HIP/ROCm support (optional)
+option(USE_HIP "Enable AMD ROCm/HIP support" OFF)
+if(USE_HIP)
+    enable_language(HIP)
+    find_package(hip REQUIRED)
+    message(STATUS "HIP found")
+    add_definitions(-DUSE_HIP)
 endif()
 
 # Sources
@@ -29,10 +38,18 @@ if(USE_CUDA)
         kernels/cuda/puzzle_kernel.cu
         kernels/cuda/cuda_solver.cu
     )
-    # CUDA architecture (tune for your GPU)
-    # 75=Turing(2070), 86=Ampere(3070), 89=Ada(4090), 90=Hopper(H20/H100)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES "86;89;90")
+    endif()
+endif()
+
+if(USE_HIP)
+    list(APPEND WORKER_SOURCES
+        kernels/hip/puzzle_kernel.hip
+        kernels/hip/hip_solver.hip
+    )
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "gfx1030") # RX 6800 XT default
     endif()
 endif()
 
@@ -77,6 +94,10 @@ find_package(Threads REQUIRED)
 
 if(USE_CUDA)
     target_link_libraries(puzzle_worker CUDA::cudart)
+endif()
+
+if(USE_HIP)
+    target_link_libraries(puzzle_worker hip::device)
 endif()
 
 # Optimization flags
