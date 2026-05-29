@@ -146,12 +146,21 @@ static void fetch_thread_fn(const std::string& base_url, const std::string& work
             continue;
         }
 
-        // Parse target_h160 (do once)
-        if (!target_ready.load()) {
+        // Parse target_h160 — update on every response to detect puzzle switch
+        {
             std::string h160_hex = json::get_string(resp.body, "target_h160");
             if (!h160_hex.empty()) {
-                hex_to_bytes(h160_hex, target_h160, 20);
-                target_ready.store(true);
+                uint8_t new_target[20];
+                hex_to_bytes(h160_hex, new_target, 20);
+                if (!target_ready.load() || memcmp(new_target, target_h160, 20) != 0) {
+                    memcpy(target_h160, new_target, 20);
+                    target_ready.store(true);
+                    int pnum = (int)json::get_int(resp.body, "puzzle_num");
+                    if (pnum > 0) {
+                        printf("  [fetch] Target updated: puzzle #%d h160=%s\n",
+                               pnum, h160_hex.c_str());
+                    }
+                }
             }
         }
 

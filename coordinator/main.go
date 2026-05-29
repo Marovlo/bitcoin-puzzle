@@ -357,10 +357,42 @@ func (c *Coordinator) reapLoop() {
 	for range time.NewTicker(60 * time.Second).C {
 		cutoff := time.Now().Add(-10 * time.Minute).Unix()
 		c.mu.Lock()
-		// Mark stale tasks as reclaimable (set assigned_at to 0 as sentinel)
 		c.db.Exec(`UPDATE active_tasks SET worker_id='__stale__', assigned_at=0 WHERE assigned_at > 0 AND assigned_at < ?`, cutoff)
 		c.mu.Unlock()
 	}
+}
+
+// Switch to a new puzzle target. Called by monitor when current puzzle is solved.
+// Workers will get the new puzzle info on their next task fetch.
+func (c *Coordinator) switchPuzzle(newPuzzleNum int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Clear in-flight tasks (they're for the old puzzle)
+	c.db.Exec(`DELETE FROM active_tasks`)
+
+	// Update coordinator state
+	c.puzzleNum = newPuzzleNum
+	c.rangeStart = new(big.Int).Lsh(big.NewInt(1), uint(newPuzzleNum-1))
+
+	chunkBits := newPuzzleNum - 1
+	if chunkBits > 30 {
+		chunkBits = 30
+	}
+	c.chunkBits = chunkBits
+	c.chunkSize = uint64(1) << uint(chunkBits)
+	exp := newPuzzleNum - 1 - chunkBits
+	if exp < 0 {
+		exp = 0
+	}
+	c.totalChunks = new(big.Int).Lsh(big.NewInt(1), uint(exp))
+	c.targetH160 = addressToH160Hex(c.puzzles[newPuzzleNum-1].Addr)
+	c.completedCount = 0
+
+	// Reset done table for new puzzle (old data is no longer relevant)
+	c.db.Exec(`DELETE FROM done`)
+
+	log.Printf("[Switch] Now targeting puzzle #%d (%s)", newPuzzleNum, c.puzzles[newPuzzleNum-1].Addr)
 }
 
 func (c *Coordinator) getStats() StatsResp {
@@ -545,6 +577,14 @@ func main() {
 	log.Printf("Total:   %s chunks", coord.totalChunks.String())
 	log.Printf("H160:    %s", coord.targetH160)
 	log.Printf("Listen:  :%s", port)
+
+	// Start puzzle monitor (auto-switch + daily email)
+	emailTo := os.Getenv("EMAIL_TO")
+	if emailTo == "" {
+		emailTo = "359207423@qq.com"
+	}
+	monitor := NewPuzzleMonitor(coord, emailTo)
+	monitor.Start()
 
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
