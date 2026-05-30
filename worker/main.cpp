@@ -340,8 +340,28 @@ int main(int argc, char** argv) {
 #endif
     } else if (backend_name == "cpu") {
         backend = std::make_unique<CPUBackend>(cpu_threads);
+#ifdef USE_CUDA
+    } else if (backend_name == "cuda") {
+        backend = std::make_unique<CUDABackend>(0, metal_batch);
+#endif
+#ifdef USE_HIP
+    } else if (backend_name == "hip") {
+        backend = std::make_unique<HIPBackend>(0);
+#endif
     } else {
-        printf("[!] Unknown backend: %s\n", backend_name.c_str()); return 1;
+        printf("[!] Unknown backend: %s\n", backend_name.c_str());
+        printf("    Available: auto, cpu");
+#ifdef __APPLE__
+        printf(", metal");
+#endif
+#ifdef USE_CUDA
+        printf(", cuda");
+#endif
+#ifdef USE_HIP
+        printf(", hip");
+#endif
+        printf("\n");
+        return 1;
     }
 
     if (!backend->init()) { printf("[!] Backend init failed\n"); return 1; }
