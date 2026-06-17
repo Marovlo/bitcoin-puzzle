@@ -17,7 +17,7 @@ static constexpr uint64_t kDefaultBatchSize = 4'000'000ull;
 // Symmetric group-addition: each GPU thread owns one group of GROUP_SIZE =
 // 2*GROUP_H+1 consecutive keys centered on C, sharing ONE mod_inv across the
 // group (Montgomery batch inversion). Must match GROUP_H in puzzle.metal.
-static constexpr uint32_t kGroupH = 64;
+static constexpr uint32_t kGroupH = 256;
 static constexpr uint64_t kKeysPerThread = 2 * kGroupH + 1;
 
 struct MetalSolver::Impl {

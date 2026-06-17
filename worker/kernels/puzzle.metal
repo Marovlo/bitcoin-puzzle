@@ -296,7 +296,7 @@ inline void ripemd160_32(thread const uchar sha[32], thread uchar h160[20]) {
 // with H cheap affine combinations sharing a single mod_inv.
 // Mirrors the CPU backend's verified search_incremental (backend_cpu.h).
 
-#define GROUP_H 64
+#define GROUP_H 256
 #define GROUP_SIZE (2 * GROUP_H + 1)
 
 inline void affine_to_h160(thread const ulong ax[4], thread const ulong ay[4],
