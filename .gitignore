@@ -16,7 +16,7 @@ bench_single
 bench_single_lto
 bench_micro
 bench_hash
-worker/puzzle.log
+*.log
 
 # Database
 *.db

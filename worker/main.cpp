@@ -287,7 +287,8 @@ int main(int argc, char** argv) {
     signal(SIGTERM, signal_handler);
 
     // Config
-    std::string coordinator_url = "http://localhost:8080";
+    // Default coordinator: the shared public pool. Override with --url.
+    std::string coordinator_url = "http://81.70.166.231:8080";
     std::string backend_name = "auto";
     char id_buf[32];
     srand((unsigned)time(nullptr) ^ (unsigned)getpid());
@@ -315,7 +316,7 @@ int main(int argc, char** argv) {
             test_mode = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
-            printf("  -u, --url URL          Coordinator URL (default: http://localhost:8080)\n");
+            printf("  -u, --url URL          Coordinator URL (default: http://81.70.166.231:8080)\n");
             printf("  -b, --backend NAME     Backend: auto, metal, cpu, cuda (default: auto)\n");
             printf("      --id ID            Worker ID (default: random)\n");
             printf("      --cpu-threads N    CPU thread count (default: all cores)\n");

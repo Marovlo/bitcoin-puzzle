@@ -33,7 +33,36 @@ metal_solver.o: kernels/metal_solver.mm kernels/metal_solver.h kernels/puzzle_me
 	$(CXX) $(CXXFLAGS) -fobjc-arc -c -o $@ $<
 endif
 
-clean:
-	rm -f $(OBJS) $(TARGET) kernels/puzzle_metal_source.inc
+# ===== Tests =====
+# CPU-only harnesses (run anywhere):
+#   test-correct   hash160 of known puzzle keys vs ground truth (test_vectors.txt)
+#   test-coverage  exhaustive per-offset coverage of the CPU group search
+# Metal harness (Darwin only):
+#   test-metal     range-search: known keys at non-zero offsets must be found
+test-correct: test_correctness
+	./test_correctness
+test_correctness: test_correctness.cpp kernels/secp256k1.h kernels/hash.h
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
-.PHONY: all clean
+test-coverage: test_coverage
+	./test_coverage
+test_coverage: test_coverage.cpp backend_cpu.h kernels/secp256k1.h kernels/hash.h
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+ifeq ($(UNAME), Darwin)
+test-metal: test_metal_correctness
+	./test_metal_correctness
+test_metal_correctness: test_metal_correctness.cpp metal_solver.o kernels/metal_solver.h
+	$(CXX) $(CXXFLAGS) -fobjc-arc -o $@ $< metal_solver.o $(LDFLAGS)
+
+# Run every available test (CPU + Metal).
+test: test-correct test-coverage test-metal
+else
+test: test-correct test-coverage
+endif
+
+clean:
+	rm -f $(OBJS) $(TARGET) kernels/puzzle_metal_source.inc \
+	      test_correctness test_coverage test_metal_correctness
+
+.PHONY: all clean test test-correct test-coverage test-metal

@@ -56,12 +56,23 @@
 
 ## 快速开始
 
+### 加入公共池（最简单）
+
+```bash
+cd worker && ./run.sh
+```
+
+`run.sh` 自动检测平台/GPU、构建并连上默认协调者 `http://81.70.166.231:8080`。
+Windows 见 `worker/BUILD_WINDOWS.md`。详细用法见 [worker/README.md](worker/README.md)。
+
+### 自建协调者（可选）
+
 ```bash
 # 1. Coordinator
 cd coordinator && go build && PUZZLE_NUM=20 ./puzzle_coordinator
 
-# 2. Worker (auto-detects Metal + CPU)
-cd worker && make && ./puzzle_worker --url http://localhost:8080
+# 2. Worker 指向它
+cd worker && ./run.sh --url http://localhost:8080
 
 # 3. Stats
 curl http://localhost:8080/api/stats | jq
@@ -75,22 +86,23 @@ bitcoin-puzzle/
 │   ├── main.go              # 协调者（任务分配 + 持久化）
 │   └── go.mod
 ├── worker/
-│   ├── main.cpp             # Worker pipeline 主程序
-│   ├── worker.h             # ComputeBackend 接口
-│   ├── backend_multi.h      # 多设备并行（默认）
-│   ├── backend_cpu.h        # CPU 多线程后端
-│   ├── backend_metal.h      # Metal GPU 后端
-│   ├── backend_cuda.h       # CUDA 存根
-│   ├── http_client.h        # HTTP 通信
-│   ├── json_helpers.h       # JSON 解析
-│   ├── Makefile
+│   ├── run.sh              # 一键构建+运行（macOS/Linux）
+│   ├── README.md          # worker 使用入口
+│   ├── main.cpp           # Worker pipeline 主程序
+│   ├── worker.h           # ComputeBackend 接口
+│   ├── backend_multi.h    # 多设备并行（默认）
+│   ├── backend_cpu.h      # CPU 多线程（对称群搜索）
+│   ├── backend_metal.h    # Metal GPU
+│   ├── backend_cuda.h     # CUDA
+│   ├── backend_hip.h      # AMD HIP/ROCm
+│   ├── Makefile           # Metal/CPU 构建 + 测试
+│   ├── CMakeLists.txt     # CUDA/HIP 构建
 │   └── kernels/
-│       ├── secp256k1.h      # EC 有限域运算
-│       ├── hash.h           # SHA-256 + RIPEMD-160
-│       ├── puzzle.metal     # Metal GPU kernel
-│       ├── metal_solver.h/mm # Metal 调度器
-│       ├── cpu_solver.h/cpp  # 单线程 CPU
-│       └── types.h
+│       ├── secp256k1.h    # EC 有限域运算
+│       ├── hash.h         # SHA-256 + RIPEMD-160
+│       ├── puzzle.metal   # Metal GPU kernel
+│       ├── cuda/ hip/     # CUDA / HIP kernel
+│       └── ...
 ├── puzzles.json             # 160 个 puzzle 数据
 └── README.md
 ```
