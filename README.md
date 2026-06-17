@@ -108,9 +108,13 @@ bitcoin-puzzle/
 
 | 后端 | 速率 | 角色 |
 |------|------|------|
-| Metal GPU | ~10 MK/s | 主力 |
-| CPU 6线程 | ~1.2 MK/s | 辅助 |
-| multi[metal+cpu] | ~11 MK/s | 默认 |
+| Metal GPU | ~83 MK/s | 主力 |
+| CPU 多线程 | ~5 MK/s | 辅助 |
+| multi[metal+cpu] | ~88 MK/s | 默认 |
+
+> Metal 实测（连协调者跑真实任务，非 init benchmark）。优化历程见
+> `worker/OPTIMIZATION_NOTES.md`：增量点加 + Montgomery 批量求逆 +
+> KEYS_PER_THREAD 调优，相对初版 14.5 MK/s 提升约 5.7x。
 
 ## 免责声明
 

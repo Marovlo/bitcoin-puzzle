@@ -55,6 +55,17 @@ constant ulong P2 = 0xFFFFFFFFFFFFFFFFul;
 constant ulong P3 = 0xFFFFFFFFFFFFFFFFul;
 constant ulong K0 = 0x00000001000003D1ul;
 
+// Generator point G (affine), little-endian by limb. Used for the incremental
+// step P_{i+1} = P_i + G when a thread walks consecutive keys.
+constant ulong GX_[4] = {0x59F2815B16F81798ul, 0x029BFCDB2DCE28D9ul,
+                         0x55A06295CE870B07ul, 0x79BE667EF9DCBBACul};
+constant ulong GY_[4] = {0x9C47D08FFB10D4B8ul, 0xFD17B448A6855419ul,
+                         0x5DA4FBFC0E1108A8ul, 0x483ADA7726A3C465ul};
+
+// Keys processed per GPU thread. One full scalar_mul_g and one batched mod_inv
+// are amortized across this many consecutive keys.
+#define KEYS_PER_THREAD 128
+
 // === Field arithmetic ===
 
 inline void mod_add(thread ulong r[4], thread const ulong a[4], thread const ulong b[4]) {
@@ -273,11 +284,27 @@ inline void ripemd160_32(thread const uchar sha[32], thread uchar h160[20]) {
 }
 
 // === Main kernel ===
-// GPU strategy: each thread = 1 key, full scalar_mul_g + mod_inv.
-// Unlike CPU (where batch inversion gives 7x), GPU threads are independent
-// and mod_inv register pressure limits occupancy. The windowed scalar_mul
-// (32 point_adds) is actually well-pipelined on GPU and hides latency.
-// Keeping 1-key-per-thread maximizes GPU occupancy.
+// Each thread walks KEYS_PER_THREAD CONSECUTIVE keys:
+//   1. P_0 = k_base * G   (one full windowed scalar_mul_g)
+//   2. P_{i+1} = P_i + G  (one cheap mixed-add per subsequent key)
+//   3. One Montgomery batch inversion turns all S Jacobian Z's into affine
+//      coords sharing a SINGLE mod_inv (the dominant cost, ~270 muls).
+//   4. hash160 + compare for each of the S keys.
+// This amortizes the two most expensive operations (scalar_mul_g and mod_inv)
+// across S keys, which is the standard speedup used by fast brute-forcers.
+
+inline void affine_to_h160(thread const ulong ax[4], thread const ulong ay[4],
+                           thread uchar h160[20]) {
+    uchar pubkey[33];
+    pubkey[0] = (uchar)(0x02u | (uint)(ay[0] & 1ul));
+    for (int i = 0; i < 4; ++i) {
+        ulong l = ax[3-i];
+        for (int j = 0; j < 8; ++j) pubkey[1+i*8+j] = (uchar)(l >> (56-8*j));
+    }
+    uchar sha[32];
+    sha256_33(pubkey, sha);
+    ripemd160_32(sha, h160);
+}
 
 kernel void puzzle_search(
     device const ulong*       g_table      [[buffer(0)]],
@@ -290,53 +317,79 @@ kernel void puzzle_search(
     device       atomic_uint* match_found  [[buffer(7)]],
     uint                      gid          [[thread_position_in_grid]])
 {
-    if ((ulong)gid >= total_keys) return;
     if (atomic_load_explicit(match_found, memory_order_relaxed) != 0u) return;
 
-    // k = start + gid
-    ulong k[4];
-    ulong c = 0;
-    k[0] = addc(start_lo, (ulong)gid, c);
-    k[1] = addc(start_hi, 0, c);
-    k[2] = c;
-    k[3] = 0;
+    // This thread owns keys [base_idx, base_idx + KEYS_PER_THREAD).
+    ulong base_idx = (ulong)gid * (ulong)KEYS_PER_THREAD;
+    if (base_idx >= total_keys) return;
 
-    // P = k * G
-    ulong px[4], py[4], pz[4];
-    scalar_mul_g(px, py, pz, k, g_table);
-    if (limbs_zero(pz)) return;
+    uint n = KEYS_PER_THREAD;
+    if (base_idx + (ulong)n > total_keys) n = (uint)(total_keys - base_idx);
 
-    // Affinize
-    ulong zi[4], zi2[4], zi3[4], ax[4], ay[4];
-    mod_inv(zi, pz);
-    mod_sqr(zi2, zi);
-    mod_mul(zi3, zi2, zi);
-    mod_mul(ax, px, zi2);
-    mod_mul(ay, py, zi3);
+    // k_base = start + base_idx  (256-bit add; base_idx < 2^40 so hi limb only)
+    ulong k0[4];
+    { ulong c = 0;
+      k0[0] = addc(start_lo, base_idx, c);
+      k0[1] = addc(start_hi, 0, c);
+      k0[2] = c; k0[3] = 0; }
 
-    // Compress pubkey
-    uchar pubkey[33];
-    pubkey[0] = (uchar)(0x02u | (uint)(ay[0] & 1ul));
-    for (int i = 0; i < 4; ++i) {
-        ulong l = ax[3-i];
-        for (int j = 0; j < 8; ++j) pubkey[1+i*8+j] = (uchar)(l >> (56-8*j));
+    // P_0 = k_base * G (Jacobian)
+    ulong PX[KEYS_PER_THREAD][4], PY[KEYS_PER_THREAD][4], PZ[KEYS_PER_THREAD][4];
+    scalar_mul_g(PX[0], PY[0], PZ[0], k0, g_table);
+
+    // G in thread address space for the incremental mixed-add.
+    ulong gx[4] = {GX_[0], GX_[1], GX_[2], GX_[3]};
+    ulong gy[4] = {GY_[0], GY_[1], GY_[2], GY_[3]};
+
+    // P_{i+1} = P_i + G via mixed addition.
+    for (uint i = 1; i < n; ++i) {
+        jac_add_mixed(PX[i], PY[i], PZ[i], PX[i-1], PY[i-1], PZ[i-1], gx, gy);
     }
 
-    // SHA256 + RIPEMD160
-    uchar sha[32], h160[20];
-    sha256_33(pubkey, sha);
-    ripemd160_32(sha, h160);
+    // Montgomery batch inversion of the n Z-coordinates: one mod_inv total.
+    // pref[i] = Z_0 * Z_1 * ... * Z_{i-1}; acc = product of all Z.
+    ulong pref[KEYS_PER_THREAD][4];
+    ulong acc[4] = {1,0,0,0};
+    for (uint i = 0; i < n; ++i) {
+        pref[i][0]=acc[0]; pref[i][1]=acc[1]; pref[i][2]=acc[2]; pref[i][3]=acc[3];
+        // Treat a zero Z (point at infinity) as 1 so the product stays invertible;
+        // such a key cannot match a real target, handled by the skip below.
+        if (limbs_zero(PZ[i])) continue;
+        mod_mul(acc, acc, PZ[i]);
+    }
+    ulong inv[4];
+    mod_inv(inv, acc);                      // 1 / (prod of all nonzero Z)
 
-    // Compare
-    bool match = true;
-    for (int i = 0; i < 20; ++i) { if (h160[i] != target_h160[i]) { match = false; break; } }
+    // Walk back: zinv_i = inv * pref[i]; then fold Z_i back into inv.
+    for (int i = (int)n - 1; i >= 0; --i) {
+        if (limbs_zero(PZ[i])) continue;    // infinity: skip, never matches
+        ulong zinv[4];
+        mod_mul(zinv, inv, pref[i]);        // = 1 / Z_i
+        mod_mul(inv, inv, PZ[i]);           // remove Z_i from running inverse
 
-    if (match) {
-        uint expected = 0u;
-        if (atomic_compare_exchange_weak_explicit(match_found, &expected, 1u,
-                memory_order_relaxed, memory_order_relaxed)) {
-            match_lo[0] = k[0];
-            match_hi[0] = k[1];
+        ulong zi2[4], zi3[4], ax[4], ay[4];
+        mod_sqr(zi2, zinv);
+        mod_mul(zi3, zi2, zinv);
+        mod_mul(ax, PX[i], zi2);
+        mod_mul(ay, PY[i], zi3);
+
+        uchar h160[20];
+        affine_to_h160(ax, ay, h160);
+
+        bool match = true;
+        for (int b = 0; b < 20; ++b) { if (h160[b] != target_h160[b]) { match = false; break; } }
+        if (match) {
+            uint expected = 0u;
+            if (atomic_compare_exchange_weak_explicit(match_found, &expected, 1u,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                // private key = start + base_idx + i
+                ulong k[4]; ulong c = 0;
+                k[0] = addc(k0[0], (ulong)i, c);
+                k[1] = addc(k0[1], 0, c);
+                match_lo[0] = k[0];
+                match_hi[0] = k[1];
+            }
         }
     }
 }
+

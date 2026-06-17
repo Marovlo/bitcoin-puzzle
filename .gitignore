@@ -7,8 +7,10 @@ puzzle_solver
 verify_correctness
 puzzle_metal_source.inc
 
-# Local test/bench harness binaries
+# Test/bench harness binaries
+test_sqr
 test_correctness
+test_metal_correctness
 test_coverage
 bench_single
 bench_single_lto
