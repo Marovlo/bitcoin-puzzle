@@ -40,7 +40,28 @@ int main(int argc, char** argv) {
         }
         memcpy(zinv[0], inv, 32);
 
-        for (int i = 0; i < bs; i++) {
+        int i = 0;
+#ifdef HASH_HAVE_AVX2_RMD
+        uint8_t pubkeys[8][33];
+        for (; i + 8 <= bs; i += 8) {
+            for (int k = 0; k < 8; k++) {
+                uint64_t zi2[4], zi3[4], ax[4], ay[4];
+                secp256k1::mod_sqr(zi2, zinv[i+k]);
+                secp256k1::mod_mul(zi3, zi2, zinv[i+k]);
+                secp256k1::mod_mul(ax, pts[i+k].X, zi2);
+                secp256k1::mod_mul(ay, pts[i+k].Y, zi3);
+                pubkeys[k][0] = 0x02 | (uint8_t)(ay[0] & 1);
+                for (int li = 0; li < 4; li++) {
+                    uint64_t l = ax[3-li];
+                    for (int j = 0; j < 8; j++) pubkeys[k][1+li*8+j] = (uint8_t)(l >> (56-8*j));
+                }
+            }
+            uint8_t h160s[8][20];
+            hash::pubkey_to_hash160_8way(pubkeys, h160s);
+            for (int k = 0; k < 8; k++) sink += h160s[k][0];
+        }
+#endif
+        for (; i < bs; i++) {
             uint64_t zi2[4], zi3[4], ax[4], ay[4];
             secp256k1::mod_sqr(zi2, zinv[i]);
             secp256k1::mod_mul(zi3, zi2, zinv[i]);

@@ -153,8 +153,49 @@ private:
             }
             memcpy(z_invs[0], inv_all, 32);
 
-            // Affinize + hash + compare
-            for (int i = 0; i < batch_size; i++) {
+            // Affinize + hash + compare.
+            // Affinize each point, then hash in groups of 8 (AVX2 8-way RIPEMD
+            // when available) with a scalar tail for any remainder.
+            int i = 0;
+#ifdef HASH_HAVE_AVX2_RMD
+            uint8_t pubkeys[8][33];
+            bool live[8];
+            for (; i + 8 <= batch_size; i += 8) {
+                if (found.load(std::memory_order_relaxed)) return;
+                for (int k = 0; k < 8; k++) {
+                    const secp256k1::JacobianPoint& Pk = points[i + k];
+                    if (secp256k1::is_infinity(Pk)) { live[k] = false; pubkeys[k][0] = 0; continue; }
+                    live[k] = true;
+                    uint64_t zi2[4], zi3[4], ax[4], ay[4];
+                    secp256k1::mod_sqr(zi2, z_invs[i + k]);
+                    secp256k1::mod_mul(zi3, zi2, z_invs[i + k]);
+                    secp256k1::mod_mul(ax, Pk.X, zi2);
+                    secp256k1::mod_mul(ay, Pk.Y, zi3);
+                    pubkeys[k][0] = 0x02 | (uint8_t)(ay[0] & 1);
+                    for (int li = 0; li < 4; li++) {
+                        uint64_t l = ax[3 - li];
+                        for (int j = 0; j < 8; j++)
+                            pubkeys[k][1 + li * 8 + j] = (uint8_t)(l >> (56 - 8 * j));
+                    }
+                }
+                uint8_t h160s[8][20];
+                hash::pubkey_to_hash160_8way(pubkeys, h160s);
+                for (int k = 0; k < 8; k++) {
+                    if (!live[k]) continue;
+                    if (memcmp(h160s[k], target, 20) == 0) {
+                        uint64_t key_idx = first_idx + (uint64_t)(i + k);
+                        uint64_t c = 0;
+                        uint64_t klo = secp256k1::addc(base_lo, key_idx, c);
+                        uint64_t khi = secp256k1::addc(base_hi, 0, c);
+                        found.store(true, std::memory_order_relaxed);
+                        result_lo.store(klo);
+                        result_hi.store(khi);
+                        return;
+                    }
+                }
+            }
+#endif
+            for (; i < batch_size; i++) {
                 if (found.load(std::memory_order_relaxed)) return;
 
                 if (secp256k1::is_infinity(points[i])) continue;

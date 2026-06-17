@@ -372,4 +372,92 @@ inline void pubkey_to_hash160(const uint8_t compressed_pubkey[33], uint8_t h160[
     ripemd160_32bytes(sha, h160);
 }
 
+#if defined(__AVX2__)
+  #define HASH_HAVE_AVX2_RMD 1
+
+// --- AVX2 8-way RIPEMD-160 over 8 independent 32-byte inputs ---
+// Each 32-byte input is the SHA-256 output; the padded block layout matches
+// ripemd160_32bytes (word[8]=0x80, word[14]=256-bit length).
+inline __m256i rmd_rotl_v(__m256i x, int n) {
+    return _mm256_or_si256(_mm256_slli_epi32(x, n), _mm256_srli_epi32(x, 32 - n));
+}
+inline __m256i rmd_not(__m256i x) { return _mm256_xor_si256(x, _mm256_set1_epi32(-1)); }
+inline __m256i rmd_f0(__m256i x, __m256i y, __m256i z) { return _mm256_xor_si256(_mm256_xor_si256(x, y), z); }
+inline __m256i rmd_f1(__m256i x, __m256i y, __m256i z) { return _mm256_or_si256(_mm256_and_si256(x, y), _mm256_andnot_si256(x, z)); }
+inline __m256i rmd_f2(__m256i x, __m256i y, __m256i z) { return _mm256_xor_si256(_mm256_or_si256(x, rmd_not(y)), z); }
+inline __m256i rmd_f3(__m256i x, __m256i y, __m256i z) { return _mm256_or_si256(_mm256_and_si256(x, z), _mm256_andnot_si256(z, y)); }
+inline __m256i rmd_f4(__m256i x, __m256i y, __m256i z) { return _mm256_xor_si256(x, _mm256_or_si256(y, rmd_not(z))); }
+
+// in: 8 contiguous 32-byte SHA outputs; out: 8 contiguous 20-byte digests.
+inline void ripemd160_8way(const uint8_t in[8][32], uint8_t out[8][20]) {
+    __m256i X[16];
+    uint32_t w[8][8];
+    for (int m = 0; m < 8; m++)
+        for (int j = 0; j < 8; j++)
+            w[m][j] = (uint32_t)in[m][j*4] | ((uint32_t)in[m][j*4+1] << 8)
+                    | ((uint32_t)in[m][j*4+2] << 16) | ((uint32_t)in[m][j*4+3] << 24);
+    for (int j = 0; j < 8; j++)
+        X[j] = _mm256_set_epi32(w[7][j], w[6][j], w[5][j], w[4][j], w[3][j], w[2][j], w[1][j], w[0][j]);
+    X[8] = _mm256_set1_epi32(0x00000080u);
+    for (int j = 9; j < 14; j++) X[j] = _mm256_setzero_si256();
+    X[14] = _mm256_set1_epi32(256u);
+    X[15] = _mm256_setzero_si256();
+
+    const __m256i I0 = _mm256_set1_epi32(0x67452301), I1 = _mm256_set1_epi32(0xEFCDAB89),
+                  I2 = _mm256_set1_epi32(0x98BADCFE), I3 = _mm256_set1_epi32(0x10325476),
+                  I4 = _mm256_set1_epi32(0xC3D2E1F0);
+    __m256i AL = I0, BL = I1, CL = I2, DL = I3, EL = I4;
+    __m256i AR = I0, BR = I1, CR = I2, DR = I3, ER = I4;
+
+    for (int round = 0; round < 5; round++) {
+        __m256i KLr = _mm256_set1_epi32((int)RMD_KL[round]);
+        __m256i KRr = _mm256_set1_epi32((int)RMD_KR[round]);
+        for (int j = round * 16; j < (round + 1) * 16; j++) {
+            __m256i fl, fr;
+            switch (round) {
+                case 0: fl = rmd_f0(BL,CL,DL); fr = rmd_f4(BR,CR,DR); break;
+                case 1: fl = rmd_f1(BL,CL,DL); fr = rmd_f3(BR,CR,DR); break;
+                case 2: fl = rmd_f2(BL,CL,DL); fr = rmd_f2(BR,CR,DR); break;
+                case 3: fl = rmd_f3(BL,CL,DL); fr = rmd_f1(BR,CR,DR); break;
+                default: fl = rmd_f4(BL,CL,DL); fr = rmd_f0(BR,CR,DR);
+            }
+            __m256i tL = _mm256_add_epi32(AL, fl);
+            tL = _mm256_add_epi32(tL, X[RMD_RL[j]]); tL = _mm256_add_epi32(tL, KLr);
+            tL = _mm256_add_epi32(rmd_rotl_v(tL, RMD_SL[j]), EL);
+            AL = EL; EL = DL; DL = rmd_rotl_v(CL, 10); CL = BL; BL = tL;
+            __m256i tR = _mm256_add_epi32(AR, fr);
+            tR = _mm256_add_epi32(tR, X[RMD_RR[j]]); tR = _mm256_add_epi32(tR, KRr);
+            tR = _mm256_add_epi32(rmd_rotl_v(tR, RMD_SR[j]), ER);
+            AR = ER; ER = DR; DR = rmd_rotl_v(CR, 10); CR = BR; BR = tR;
+        }
+    }
+
+    __m256i H0 = _mm256_add_epi32(_mm256_add_epi32(I1, CL), DR);
+    __m256i H1 = _mm256_add_epi32(_mm256_add_epi32(I2, DL), ER);
+    __m256i H2 = _mm256_add_epi32(_mm256_add_epi32(I3, EL), AR);
+    __m256i H3 = _mm256_add_epi32(_mm256_add_epi32(I4, AL), BR);
+    __m256i H4 = _mm256_add_epi32(_mm256_add_epi32(I0, BL), CR);
+    uint32_t h0[8], h1[8], h2[8], h3[8], h4[8];
+    _mm256_storeu_si256((__m256i*)h0, H0); _mm256_storeu_si256((__m256i*)h1, H1);
+    _mm256_storeu_si256((__m256i*)h2, H2); _mm256_storeu_si256((__m256i*)h3, H3);
+    _mm256_storeu_si256((__m256i*)h4, H4);
+    for (int m = 0; m < 8; m++) {
+        uint32_t H[5] = {h0[m], h1[m], h2[m], h3[m], h4[m]};
+        for (int i = 0; i < 5; i++) {
+            out[m][i*4]   = (uint8_t)(H[i]);
+            out[m][i*4+1] = (uint8_t)(H[i] >> 8);
+            out[m][i*4+2] = (uint8_t)(H[i] >> 16);
+            out[m][i*4+3] = (uint8_t)(H[i] >> 24);
+        }
+    }
+}
+
+// 8 compressed pubkeys -> 8 hash160 (SHA-256 each, then one 8-way RIPEMD-160).
+inline void pubkey_to_hash160_8way(const uint8_t pubkeys[8][33], uint8_t h160[8][20]) {
+    uint8_t sha[8][32];
+    for (int m = 0; m < 8; m++) sha256_33bytes(pubkeys[m], sha[m]);
+    ripemd160_8way(sha, h160);
+}
+#endif // HASH_HAVE_AVX2_RMD
+
 }  // namespace hash
