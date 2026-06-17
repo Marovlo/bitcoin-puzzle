@@ -7,6 +7,14 @@ puzzle_solver
 verify_correctness
 puzzle_metal_source.inc
 
+# Local test/bench harness binaries
+test_correctness
+bench_single
+bench_single_lto
+bench_micro
+bench_hash
+worker/puzzle.log
+
 # Database
 *.db
 *.db-wal
