@@ -9,6 +9,7 @@ puzzle_metal_source.inc
 
 # Local test/bench harness binaries
 test_correctness
+test_coverage
 bench_single
 bench_single_lto
 bench_micro
