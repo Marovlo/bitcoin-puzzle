@@ -64,7 +64,7 @@ constant ulong GY_[4] = {0x9C47D08FFB10D4B8ul, 0xFD17B448A6855419ul,
 
 // Keys processed per GPU thread. One full scalar_mul_g and one batched mod_inv
 // are amortized across this many consecutive keys.
-#define KEYS_PER_THREAD 8
+#define KEYS_PER_THREAD 128
 
 // === Field arithmetic ===
 

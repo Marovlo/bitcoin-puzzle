@@ -16,7 +16,7 @@ static constexpr uint32_t kThreadgroupWidth = 32;
 static constexpr uint64_t kDefaultBatchSize = 4'000'000ull;
 // Must match KEYS_PER_THREAD in puzzle.metal: each thread walks this many
 // consecutive keys, so the dispatched thread count is total_keys / this.
-static constexpr uint64_t kKeysPerThread = 8;
+static constexpr uint64_t kKeysPerThread = 128;
 
 struct MetalSolver::Impl {
     id<MTLDevice>               device   = nil;
