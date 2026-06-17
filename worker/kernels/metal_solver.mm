@@ -14,9 +14,11 @@ static const char* kMetalShaderSource =
 
 static constexpr uint32_t kThreadgroupWidth = 32;
 static constexpr uint64_t kDefaultBatchSize = 4'000'000ull;
-// Must match KEYS_PER_THREAD in puzzle.metal: each thread walks this many
-// consecutive keys, so the dispatched thread count is total_keys / this.
-static constexpr uint64_t kKeysPerThread = 128;
+// Symmetric group-addition: each GPU thread owns one group of GROUP_SIZE =
+// 2*GROUP_H+1 consecutive keys centered on C, sharing ONE mod_inv across the
+// group (Montgomery batch inversion). Must match GROUP_H in puzzle.metal.
+static constexpr uint32_t kGroupH = 256;
+static constexpr uint64_t kKeysPerThread = 2 * kGroupH + 1;
 
 struct MetalSolver::Impl {
     id<MTLDevice>               device   = nil;
@@ -25,6 +27,7 @@ struct MetalSolver::Impl {
     id<MTLComputePipelineState> pipe     = nil;
 
     id<MTLBuffer> b_gtable    = nil;
+    id<MTLBuffer> b_igtable   = nil;   // i*G affine table, i=1..GROUP_H (+ step at slot 0)
     id<MTLBuffer> b_target    = nil;
     id<MTLBuffer> b_match_lo  = nil;
     id<MTLBuffer> b_match_hi  = nil;
@@ -105,6 +108,11 @@ bool MetalSolver::init() {
         static constexpr size_t gtable_bytes = secp256k1::G_TABLE_ULONGS * sizeof(uint64_t);
         impl_->b_gtable    = [impl_->device newBufferWithLength:gtable_bytes
                                                         options:MTLResourceStorageModeShared];
+        // i*G affine table: slot 0 = step (GROUP_SIZE*G), slots 1..H = i*G.
+        static constexpr size_t igtable_slots = (size_t)(kGroupH + 1);
+        static constexpr size_t igtable_bytes = igtable_slots * 8 * sizeof(uint64_t);
+        impl_->b_igtable   = [impl_->device newBufferWithLength:igtable_bytes
+                                                        options:MTLResourceStorageModeShared];
         impl_->b_target    = [impl_->device newBufferWithLength:20
                                                         options:MTLResourceStorageModeShared];
         impl_->b_match_lo  = [impl_->device newBufferWithLength:sizeof(uint64_t)
@@ -114,8 +122,8 @@ bool MetalSolver::init() {
         impl_->b_match_fnd = [impl_->device newBufferWithLength:sizeof(uint32_t)
                                                         options:MTLResourceStorageModeShared];
 
-        if (!impl_->b_gtable || !impl_->b_target || !impl_->b_match_lo ||
-            !impl_->b_match_hi || !impl_->b_match_fnd) {
+        if (!impl_->b_gtable || !impl_->b_igtable || !impl_->b_target ||
+            !impl_->b_match_lo || !impl_->b_match_hi || !impl_->b_match_fnd) {
             impl_->error_str = "Buffer allocation failed";
             return false;
         }
@@ -124,6 +132,27 @@ bool MetalSolver::init() {
         std::vector<uint64_t> gtable_host(secp256k1::G_TABLE_ULONGS);
         secp256k1::build_g_table(gtable_host.data());
         memcpy([impl_->b_gtable contents], gtable_host.data(), gtable_bytes);
+
+        // Build i*G affine table: slot 0 = (GROUP_SIZE)*G (center step), slots
+        // 1..H = i*G. Each slot is 8 ulongs: x[0..3], y[0..3]. Shared by every
+        // thread for symmetric group addition.
+        {
+            uint64_t* ig = (uint64_t*)[impl_->b_igtable contents];
+            auto affine_of = [&](uint64_t scalar, uint64_t* out_x, uint64_t* out_y) {
+                uint64_t k[4] = {scalar, 0, 0, 0};
+                secp256k1::JacobianPoint P;
+                secp256k1::scalar_mul_g_windowed(P, k, gtable_host.data());
+                uint64_t zi[4], zi2[4], zi3[4];
+                secp256k1::mod_inv(zi, P.Z);
+                secp256k1::mod_sqr(zi2, zi);
+                secp256k1::mod_mul(zi3, zi2, zi);
+                secp256k1::mod_mul(out_x, P.X, zi2);
+                secp256k1::mod_mul(out_y, P.Y, zi3);
+            };
+            affine_of((uint64_t)kKeysPerThread, &ig[0], &ig[4]);          // step
+            for (uint32_t i = 1; i <= kGroupH; ++i)
+                affine_of((uint64_t)i, &ig[i * 8], &ig[i * 8 + 4]);       // i*G
+        }
 
         return true;
     }
@@ -160,6 +189,7 @@ SearchResult MetalSolver::search_batch(uint64_t start_lo, uint64_t start_hi,
         [enc setBuffer:impl_->b_match_lo  offset:0 atIndex:5];
         [enc setBuffer:impl_->b_match_hi  offset:0 atIndex:6];
         [enc setBuffer:impl_->b_match_fnd offset:0 atIndex:7];
+        [enc setBuffer:impl_->b_igtable   offset:0 atIndex:8];
 
         NSUInteger maxTPT = [impl_->pipe maxTotalThreadsPerThreadgroup];
         NSUInteger tg = (kThreadgroupWidth <= maxTPT) ? kThreadgroupWidth : maxTPT;

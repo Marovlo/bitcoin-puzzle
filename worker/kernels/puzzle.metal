@@ -283,15 +283,21 @@ inline void ripemd160_32(thread const uchar sha[32], thread uchar h160[20]) {
     for(int i=0;i<5;i++){h160[i*4]=(uchar)Hf[i];h160[i*4+1]=(uchar)(Hf[i]>>8);h160[i*4+2]=(uchar)(Hf[i]>>16);h160[i*4+3]=(uchar)(Hf[i]>>24);}
 }
 
-// === Main kernel ===
-// Each thread walks KEYS_PER_THREAD CONSECUTIVE keys:
-//   1. P_0 = k_base * G   (one full windowed scalar_mul_g)
-//   2. P_{i+1} = P_i + G  (one cheap mixed-add per subsequent key)
-//   3. One Montgomery batch inversion turns all S Jacobian Z's into affine
-//      coords sharing a SINGLE mod_inv (the dominant cost, ~270 muls).
-//   4. hash160 + compare for each of the S keys.
-// This amortizes the two most expensive operations (scalar_mul_g and mod_inv)
-// across S keys, which is the standard speedup used by fast brute-forcers.
+// === Main kernel: symmetric group addition ===
+// Each thread owns one GROUP of GROUP_SIZE = 2*GROUP_H+1 consecutive keys,
+// centered on scalar C:
+//   1. C = center_index * G  (one windowed scalar_mul_g + one mod_inv to affinize)
+//   2. For i=1..H, the affine multiples i*G are precomputed constants (ig_table).
+//      The points C +/- i*G share the SAME x-difference den[i] = x(iG) - Cx,
+//      so one batch inversion over the H denominators yields every slope.
+//   3. Each of the 2H output points costs ~3 field muls and is produced already
+//      in affine form (no separate per-point inverse). Hash + compare on the fly.
+// This replaces the 2H-long Jacobian incremental-add chain (the old bottleneck)
+// with H cheap affine combinations sharing a single mod_inv.
+// Mirrors the CPU backend's verified search_incremental (backend_cpu.h).
+
+#define GROUP_H 256
+#define GROUP_SIZE (2 * GROUP_H + 1)
 
 inline void affine_to_h160(thread const ulong ax[4], thread const ulong ay[4],
                            thread uchar h160[20]) {
@@ -306,6 +312,25 @@ inline void affine_to_h160(thread const ulong ax[4], thread const ulong ay[4],
     ripemd160_32(sha, h160);
 }
 
+// Compare h160(ax,ay) to target; on match, CAS-publish private key = start+idx.
+inline void check_point(thread const ulong ax[4], thread const ulong ay[4],
+                        device const uchar* target_h160, ulong start_lo, ulong start_hi,
+                        ulong key_idx, device ulong* match_lo, device ulong* match_hi,
+                        device atomic_uint* match_found) {
+    uchar h160[20];
+    affine_to_h160(ax, ay, h160);
+    for (int b = 0; b < 20; ++b) if (h160[b] != target_h160[b]) return;
+    uint expected = 0u;
+    if (atomic_compare_exchange_weak_explicit(match_found, &expected, 1u,
+            memory_order_relaxed, memory_order_relaxed)) {
+        ulong c = 0;
+        ulong klo = addc(start_lo, key_idx, c);
+        ulong khi = addc(start_hi, 0, c);
+        match_lo[0] = klo;
+        match_hi[0] = khi;
+    }
+}
+
 kernel void puzzle_search(
     device const ulong*       g_table      [[buffer(0)]],
     device const uchar*       target_h160  [[buffer(1)]],
@@ -315,81 +340,111 @@ kernel void puzzle_search(
     device       ulong*       match_lo     [[buffer(5)]],
     device       ulong*       match_hi     [[buffer(6)]],
     device       atomic_uint* match_found  [[buffer(7)]],
+    device const ulong*       ig_table     [[buffer(8)]],
     uint                      gid          [[thread_position_in_grid]])
 {
     if (atomic_load_explicit(match_found, memory_order_relaxed) != 0u) return;
 
-    // This thread owns keys [base_idx, base_idx + KEYS_PER_THREAD).
-    ulong base_idx = (ulong)gid * (ulong)KEYS_PER_THREAD;
-    if (base_idx >= total_keys) return;
+    // This thread owns the group of GROUP_SIZE keys starting at g_start.
+    ulong g_start = (ulong)gid * (ulong)GROUP_SIZE;
+    if (g_start >= total_keys) return;
 
-    uint n = KEYS_PER_THREAD;
-    if (base_idx + (ulong)n > total_keys) n = (uint)(total_keys - base_idx);
-
-    // k_base = start + base_idx  (256-bit add; base_idx < 2^40 so hi limb only)
-    ulong k0[4];
+    // Center scalar index (relative to start) = g_start + GROUP_H.
+    ulong center_index = g_start + (ulong)GROUP_H;
+    ulong kc[4];
     { ulong c = 0;
-      k0[0] = addc(start_lo, base_idx, c);
-      k0[1] = addc(start_hi, 0, c);
-      k0[2] = c; k0[3] = 0; }
+      kc[0] = addc(start_lo, center_index, c);
+      kc[1] = addc(start_hi, 0, c);
+      kc[2] = c; kc[3] = 0; }
 
-    // P_0 = k_base * G (Jacobian)
-    ulong PX[KEYS_PER_THREAD][4], PY[KEYS_PER_THREAD][4], PZ[KEYS_PER_THREAD][4];
-    scalar_mul_g(PX[0], PY[0], PZ[0], k0, g_table);
+    // C = center_index * G, affinized.
+    ulong CXj[4], CYj[4], CZj[4];
+    scalar_mul_g(CXj, CYj, CZj, kc, g_table);
+    if (limbs_zero(CZj)) return;             // center at infinity (impossible for real range)
+    ulong Cx[4], Cy[4];
+    { ulong zi[4], zi2[4], zi3[4];
+      mod_inv(zi, CZj); mod_sqr(zi2, zi); mod_mul(zi3, zi2, zi);
+      mod_mul(Cx, CXj, zi2); mod_mul(Cy, CYj, zi3); }
 
-    // G in thread address space for the incremental mixed-add.
-    ulong gx[4] = {GX_[0], GX_[1], GX_[2], GX_[3]};
-    ulong gy[4] = {GY_[0], GY_[1], GY_[2], GY_[3]};
-
-    // P_{i+1} = P_i + G via mixed addition.
-    for (uint i = 1; i < n; ++i) {
-        jac_add_mixed(PX[i], PY[i], PZ[i], PX[i-1], PY[i-1], PZ[i-1], gx, gy);
+    // Denominators den[i] = x(i*G) - Cx, i=1..H.  ig_table slot i = (x[4],y[4]).
+    ulong den[GROUP_H + 1][4];
+    bool degenerate = false;
+    for (uint i = 1; i <= GROUP_H; ++i) {
+        ulong igx[4] = {ig_table[i*8], ig_table[i*8+1], ig_table[i*8+2], ig_table[i*8+3]};
+        mod_sub(den[i], igx, Cx);
+        if (limbs_zero(den[i])) degenerate = true;
     }
 
-    // Montgomery batch inversion of the n Z-coordinates: one mod_inv total.
-    // pref[i] = Z_0 * Z_1 * ... * Z_{i-1}; acc = product of all Z.
-    ulong pref[KEYS_PER_THREAD][4];
-    ulong acc[4] = {1,0,0,0};
-    for (uint i = 0; i < n; ++i) {
-        pref[i][0]=acc[0]; pref[i][1]=acc[1]; pref[i][2]=acc[2]; pref[i][3]=acc[3];
-        // Treat a zero Z (point at infinity) as 1 so the product stays invertible;
-        // such a key cannot match a real target, handled by the skip below.
-        if (limbs_zero(PZ[i])) continue;
-        mod_mul(acc, acc, PZ[i]);
+    if (degenerate) {
+        // Astronomically rare (center.x collides with a table x). Recompute the
+        // whole group directly so we never skip or mis-emit a key.
+        for (uint m = 0; m < GROUP_SIZE; ++m) {
+            ulong idx = g_start + (ulong)m;
+            if (idx >= total_keys) break;
+            ulong k[4]; { ulong c = 0;
+              k[0] = addc(start_lo, idx, c); k[1] = addc(start_hi, 0, c); k[2]=c; k[3]=0; }
+            ulong px[4], py[4], pz[4];
+            scalar_mul_g(px, py, pz, k, g_table);
+            if (limbs_zero(pz)) continue;
+            ulong zi[4], zi2[4], zi3[4], ax[4], ay[4];
+            mod_inv(zi, pz); mod_sqr(zi2, zi); mod_mul(zi3, zi2, zi);
+            mod_mul(ax, px, zi2); mod_mul(ay, py, zi3);
+            check_point(ax, ay, target_h160, start_lo, start_hi, idx,
+                        match_lo, match_hi, match_found);
+        }
+        return;
     }
-    ulong inv[4];
-    mod_inv(inv, acc);                      // 1 / (prod of all nonzero Z)
 
-    // Walk back: zinv_i = inv * pref[i]; then fold Z_i back into inv.
-    for (int i = (int)n - 1; i >= 0; --i) {
-        if (limbs_zero(PZ[i])) continue;    // infinity: skip, never matches
-        ulong zinv[4];
-        mod_mul(zinv, inv, pref[i]);        // = 1 / Z_i
-        mod_mul(inv, inv, PZ[i]);           // remove Z_i from running inverse
+    // Batch invert den[1..H] (Montgomery trick): one mod_inv for the group.
+    ulong pre[GROUP_H + 1][4];
+    pre[1][0]=den[1][0]; pre[1][1]=den[1][1]; pre[1][2]=den[1][2]; pre[1][3]=den[1][3];
+    for (uint i = 2; i <= GROUP_H; ++i) mod_mul(pre[i], pre[i-1], den[i]);
+    ulong acc[4];
+    mod_inv(acc, pre[GROUP_H]);
+    ulong inv[GROUP_H + 1][4];
+    for (int i = GROUP_H; i >= 1; --i) {
+        if (i > 1) mod_mul(inv[i], acc, pre[i-1]);
+        else { inv[1][0]=acc[0]; inv[1][1]=acc[1]; inv[1][2]=acc[2]; inv[1][3]=acc[3]; }
+        mod_mul(acc, acc, den[i]);
+    }
 
-        ulong zi2[4], zi3[4], ax[4], ay[4];
-        mod_sqr(zi2, zinv);
-        mod_mul(zi3, zi2, zinv);
-        mod_mul(ax, PX[i], zi2);
-        mod_mul(ay, PY[i], zi3);
+    // Center key (index g_start + GROUP_H).
+    if (center_index < total_keys)
+        check_point(Cx, Cy, target_h160, start_lo, start_hi, center_index,
+                    match_lo, match_hi, match_found);
 
-        uchar h160[20];
-        affine_to_h160(ax, ay, h160);
+    // C +/- i*G for i=1..H, sharing inv[i]. -P just negates y.
+    for (uint i = 1; i <= GROUP_H; ++i) {
+        ulong igx[4] = {ig_table[i*8], ig_table[i*8+1], ig_table[i*8+2], ig_table[i*8+3]};
+        ulong igy[4] = {ig_table[i*8+4], ig_table[i*8+5], ig_table[i*8+6], ig_table[i*8+7]};
 
-        bool match = true;
-        for (int b = 0; b < 20; ++b) { if (h160[b] != target_h160[b]) { match = false; break; } }
-        if (match) {
-            uint expected = 0u;
-            if (atomic_compare_exchange_weak_explicit(match_found, &expected, 1u,
-                    memory_order_relaxed, memory_order_relaxed)) {
-                // private key = start + base_idx + i
-                ulong k[4]; ulong c = 0;
-                k[0] = addc(k0[0], (ulong)i, c);
-                k[1] = addc(k0[1], 0, c);
-                match_lo[0] = k[0];
-                match_hi[0] = k[1];
-            }
+        // C + i*G  -> index (GROUP_H + i)
+        ulong up = g_start + (ulong)GROUP_H + (ulong)i;
+        if (up < total_keys) {
+            ulong dy[4], s[4], x3[4], y3[4], t[4];
+            mod_sub(dy, igy, Cy);
+            mod_mul(s, dy, inv[i]);
+            mod_sqr(x3, s); mod_sub(x3, x3, Cx); mod_sub(x3, x3, igx);
+            mod_sub(t, Cx, x3); mod_mul(y3, s, t); mod_sub(y3, y3, Cy);
+            check_point(x3, y3, target_h160, start_lo, start_hi, up,
+                        match_lo, match_hi, match_found);
+        }
+
+        // C - i*G  -> index (GROUP_H - i), uses Q = (igx, -igy)
+        ulong ny[4];   // -igy mod p  (igy != 0 for i>=1)
+        { ulong bo=0; ny[0]=subb(P0, igy[0], bo); ny[1]=subb(P1, igy[1], bo);
+          ny[2]=subb(P2, igy[2], bo); ny[3]=subb(P3, igy[3], bo); }
+        ulong down = g_start + (ulong)GROUP_H - (ulong)i;   // GROUP_H-i >= 0
+        if (down < total_keys) {
+            ulong dy2[4], s2[4], x3b[4], y3b[4], t2[4];
+            mod_sub(dy2, ny, Cy);
+            mod_mul(s2, dy2, inv[i]);
+            mod_sqr(x3b, s2); mod_sub(x3b, x3b, Cx); mod_sub(x3b, x3b, igx);
+            mod_sub(t2, Cx, x3b); mod_mul(y3b, s2, t2); mod_sub(y3b, y3b, Cy);
+            check_point(x3b, y3b, target_h160, start_lo, start_hi, down,
+                        match_lo, match_hi, match_found);
         }
     }
 }
+
 
