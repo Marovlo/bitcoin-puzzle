@@ -7,6 +7,12 @@ puzzle_solver
 verify_correctness
 puzzle_metal_source.inc
 
+# Test binaries
+test_sqr
+test_correctness
+test_metal_correctness
+test_coverage
+
 # Database
 *.db
 *.db-wal
