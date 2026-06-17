@@ -14,6 +14,9 @@ static const char* kMetalShaderSource =
 
 static constexpr uint32_t kThreadgroupWidth = 32;
 static constexpr uint64_t kDefaultBatchSize = 4'000'000ull;
+// Must match KEYS_PER_THREAD in puzzle.metal: each thread walks this many
+// consecutive keys, so the dispatched thread count is total_keys / this.
+static constexpr uint64_t kKeysPerThread = 8;
 
 struct MetalSolver::Impl {
     id<MTLDevice>               device   = nil;
@@ -161,7 +164,10 @@ SearchResult MetalSolver::search_batch(uint64_t start_lo, uint64_t start_hi,
         NSUInteger maxTPT = [impl_->pipe maxTotalThreadsPerThreadgroup];
         NSUInteger tg = (kThreadgroupWidth <= maxTPT) ? kThreadgroupWidth : maxTPT;
 
-        [enc dispatchThreads:MTLSizeMake(total_keys, 1, 1)
+        // Each thread processes kKeysPerThread consecutive keys.
+        uint64_t num_threads = (total_keys + kKeysPerThread - 1) / kKeysPerThread;
+
+        [enc dispatchThreads:MTLSizeMake(num_threads, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
         [cmd commit];
