@@ -80,6 +80,50 @@ inline void mod_sub(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
 
 // 256x256 -> 512, then reduce mod p using 2^256 = K0 trick
 inline void mod_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+#if defined(__BMI2__) && defined(__ADX__)
+    // Full 512-bit product via MULX (flag-free multiply) plus two independent
+    // carry chains (ADCX on CF, ADOX on OF). Result limbs w[0..7] little-endian.
+    uint64_t w[8];
+    __asm__ __volatile__(
+        "movq 0(%%rbx), %%rdx\n\t"  "xorq %%r15, %%r15\n\t"      // rdx=b[0]; r15=0, clears CF/OF
+        // row 0: a[*]*b[0]
+        "mulxq 0(%%rsi), %%r8,  %%r9\n\t"
+        "mulxq 8(%%rsi), %%rax, %%r10\n\t" "adcxq %%rax, %%r9\n\t"
+        "mulxq 16(%%rsi),%%rax, %%r11\n\t" "adcxq %%rax, %%r10\n\t"
+        "mulxq 24(%%rsi),%%rax, %%r12\n\t" "adcxq %%rax, %%r11\n\t"
+        "adcxq %%r15, %%r12\n\t"  "movq %%r8, 0(%%rdi)\n\t"
+        // row 1: a[*]*b[1]
+        "movq 8(%%rbx), %%rdx\n\t"  "xorq %%r13, %%r13\n\t"
+        "mulxq 0(%%rsi), %%rax, %%rcx\n\t" "adcxq %%rax, %%r9\n\t"  "adoxq %%rcx, %%r10\n\t"
+        "movq %%r9, 8(%%rdi)\n\t"
+        "mulxq 8(%%rsi), %%rax, %%rcx\n\t" "adcxq %%rax, %%r10\n\t" "adoxq %%rcx, %%r11\n\t"
+        "mulxq 16(%%rsi),%%rax, %%rcx\n\t" "adcxq %%rax, %%r11\n\t" "adoxq %%rcx, %%r12\n\t"
+        "mulxq 24(%%rsi),%%rax, %%rcx\n\t" "adcxq %%rax, %%r12\n\t" "adoxq %%rcx, %%r13\n\t"
+        "adcxq %%r15, %%r13\n\t"
+        // row 2: a[*]*b[2]
+        "movq 16(%%rbx), %%rdx\n\t"  "xorq %%r14, %%r14\n\t"
+        "mulxq 0(%%rsi), %%rax, %%rcx\n\t" "adcxq %%rax, %%r10\n\t" "adoxq %%rcx, %%r11\n\t"
+        "movq %%r10, 16(%%rdi)\n\t"
+        "mulxq 8(%%rsi), %%rax, %%rcx\n\t" "adcxq %%rax, %%r11\n\t" "adoxq %%rcx, %%r12\n\t"
+        "mulxq 16(%%rsi),%%rax, %%rcx\n\t" "adcxq %%rax, %%r12\n\t" "adoxq %%rcx, %%r13\n\t"
+        "mulxq 24(%%rsi),%%rax, %%rcx\n\t" "adcxq %%rax, %%r13\n\t" "adoxq %%rcx, %%r14\n\t"
+        "adcxq %%r15, %%r14\n\t"
+        // row 3: a[*]*b[3]
+        "movq 24(%%rbx), %%rdx\n\t"  "xorq %%r8, %%r8\n\t"
+        "mulxq 0(%%rsi), %%rax, %%rcx\n\t" "adcxq %%rax, %%r11\n\t" "adoxq %%rcx, %%r12\n\t"
+        "movq %%r11, 24(%%rdi)\n\t"
+        "mulxq 8(%%rsi), %%rax, %%rcx\n\t" "adcxq %%rax, %%r12\n\t" "adoxq %%rcx, %%r13\n\t"
+        "movq %%r12, 32(%%rdi)\n\t"
+        "mulxq 16(%%rsi),%%rax, %%rcx\n\t" "adcxq %%rax, %%r13\n\t" "adoxq %%rcx, %%r14\n\t"
+        "movq %%r13, 40(%%rdi)\n\t"
+        "mulxq 24(%%rsi),%%rax, %%rcx\n\t" "adcxq %%rax, %%r14\n\t" "adoxq %%rcx, %%r8\n\t"
+        "adcxq %%r15, %%r8\n\t"  "movq %%r14, 48(%%rdi)\n\t"  "movq %%r8, 56(%%rdi)\n\t"
+        :: "D"(w), "S"(a), "b"(b)
+        : "rax","rcx","rdx","r8","r9","r10","r11","r12","r13","r14","r15","cc","memory");
+
+    uint64_t lo[4] = {w[0], w[1], w[2], w[3]};
+    uint64_t hi[4] = {w[4], w[5], w[6], w[7]};
+#else
     // Full 512-bit product via schoolbook with 128-bit intermediates
     unsigned __int128 w[8] = {};
     for (int i = 0; i < 4; ++i) {
@@ -94,6 +138,7 @@ inline void mod_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
 
     uint64_t lo[4] = {(uint64_t)w[0], (uint64_t)w[1], (uint64_t)w[2], (uint64_t)w[3]};
     uint64_t hi[4] = {(uint64_t)w[4], (uint64_t)w[5], (uint64_t)w[6], (uint64_t)w[7]};
+#endif
 
     // Reduce: result = lo + hi * K0
     unsigned __int128 carry = 0;
