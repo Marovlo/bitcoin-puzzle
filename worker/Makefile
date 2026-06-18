@@ -1,9 +1,20 @@
 # Bitcoin Puzzle Pool Worker
 CXX      := clang++
-CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -DNDEBUG -march=native -I. -Ikernels
 
 UNAME := $(shell uname -s)
+ARCH  := $(shell uname -m)
 TARGET := puzzle_worker
+
+# On Apple Silicon / arm64, -march=native does NOT enable the ARMv8 crypto
+# (SHA-256) feature macros that hash.h needs; -mcpu=native does, and keeps
+# all the same tuning. Use it on arm64, plain -march=native elsewhere.
+ifeq ($(ARCH), arm64)
+    ARCHFLAG := -mcpu=native
+else
+    ARCHFLAG := -march=native
+endif
+
+CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -DNDEBUG $(ARCHFLAG) -I. -Ikernels
 
 ifeq ($(UNAME), Darwin)
     FRAMEWORKS := -framework Metal -framework Foundation -framework CoreGraphics

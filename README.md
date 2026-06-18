@@ -121,12 +121,13 @@ bitcoin-puzzle/
 | 后端 | 速率 | 角色 |
 |------|------|------|
 | Metal GPU | ~180 MK/s | 主力 |
-| CPU 多线程 | ~5 MK/s | 辅助 |
-| multi[metal+cpu] | ~185 MK/s | 默认 |
+| CPU 12 线程 | ~46 MK/s | 辅助 |
+| multi[metal+cpu] | ~225 MK/s | 默认 |
 
-> Metal 实测（连协调者跑真实任务，非 init benchmark）。优化历程见
-> `worker/OPTIMIZATION_NOTES.md`：增量点加 + Montgomery 批量求逆 +
-> 对称群加 C±i·G + GROUP_H 调优，相对初版 14.5 MK/s 提升约 12.4x。
+> 实测（连协调者跑真实任务，非 init benchmark）。优化历程见
+> `worker/OPTIMIZATION_NOTES.md`。
+> - **Metal**：增量点加 + Montgomery 批量求逆 + 对称群加 C±i·G + GROUP_H 调优，14.5 → 180 MK/s（12.4x）
+> - **Mac CPU (ARM)**：work-stealing 负载均衡（异构 P/E 核）+ ARMv8 SHA-256 硬件指令 + NEON 4路 RIPEMD-160，约 18 → 46 MK/s（2.5x）
 
 ## 免责声明
 
