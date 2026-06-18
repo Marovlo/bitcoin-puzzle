@@ -136,8 +136,28 @@ CPU 后端（x86, AMD EPYC Zen2）已落地四项，单线程 1.11 → 4.96 MK/s
 > **(A) `-march=native` 在 Apple clang 的 arm64 上 _不_ 启用 crypto 特性宏。**
 > 这是最隐蔽的坑：`__ARM_FEATURE_SHA2` / `__ARM_NEON` 在裸 clang 默认 target 下有，但加了 `-march=native` 反而消失，导致 ARM SHA 路径永远走不到。必须用 **`-mcpu=native`**（保留全部 native 调优 + 启用 crypto）。Makefile 已按 `uname -m == arm64` 切换。验证：`echo | clang++ -mcpu=native -dM -E -x c++ - | grep ARM_FEATURE_SHA2`。
 
-> **(B) 异构 P/E 核：静态均分是错的。**
-> 原 `backend_cpu` 把 chunk 平均切 N 份，总耗时被最慢的能效核拖住（性能核算完空等）。改为原子计数器分发 GROUP_SIZE 对齐的小 tile（work-stealing），性能核自然多抢。扩展比从 ~6 线程后塌陷恢复到 12 线程 ~8x。
+> **(B) 动态自调度（原子任务拉取）——平台无关的默认负载均衡，不是 ARM 专属。**
+> 原 `backend_cpu` 把 chunk 平均切 N 份（静态 push），总耗时被最慢的核绑架。改为：把范围切成大量 GROUP_SIZE 对齐的 tile，用一个原子计数器 `next_tile.fetch_add(1)` 分发，**谁先算完谁拉下一块**（pull 模型）。
+>
+> **它对所有"让核心实际速度不一致"的因素自动适应，与指令集无关**：
+> - Apple P/E 核、**Intel 12 代起的 P/E 大小核**（E-core ≈ P-core 的 40-60%）
+> - Turbo / 单核睿频、热降频、超线程（SMT）
+> - **某个核被别的进程临时抢占** —— 它自然少拉 tile，其余核分摊，总耗时几乎不受影响
+>
+> 因为是"按运行时实际产能拉取"而非"预先按核数推送"，对这类可独立切分的工作负载（embarrassingly parallel）几乎严格优于静态均分，代价近乎零 → **应作为全平台默认**。x86/ARM 共用同一份纯 `std::thread`+`std::atomic` 代码。
+>
+> **tile 粒度量化（M3 Pro 实测）**：每 tile 固定开销 ≈ scalar_mul_g 重算 1015ns + 原子 30ns；稳态 ≈ 163 ns/key。两个相反损失（2³⁰ chunk、12 线程的最坏估计）：
+>
+> | tile | #tiles | 固定开销% | 长尾最坏% | 总% |
+> |------|--------|----------|----------|-----|
+> | GROUP×16 | 131k | 0.078 | 0.009 | 0.087 |
+> | **GROUP×32** | 65k | 0.039 | 0.018 | **0.057** ← 选用 |
+> | GROUP×64 | 33k | 0.020 | 0.037 | 0.056 |
+> | GROUP×256 | 8k | 0.005 | 0.147 | 0.152 |
+>
+> U 型谷底在 GROUP×32~64。真正的开销大头是**每 tile 重算一次中心点（scalar_mul_g，比原子贵 33×）**，不是原子争用——所以 tile 不能太小；但太大长尾上升。选 GROUP×32（谷底 + 对小 `size` 更稳，每核保证 ≥8 块）。注意：`size` 很小时需缩小 tile，否则切不出足够块会退化成少数核——代码里有该分支。
+>
+> 升级方向：当前是单一共享计数器（tile 大、争用可忽略）。若未来 tile 需极小，可换 per-thread 本地队列 + 偷尾（rayon/TBB 式）消除争用与长尾。
 
 > **(C) ARM SHA-256 结构比 x86 SHA-NI 干净。**
 > 无需 x86 那套 state shuffle（abef/cdgh 重排）。直接 `vsha256hq_u32` + `vsha256h2q_u32` 配对，`vsha256su0/su1` 做消息扩展，load/store 用 `vrev32q_u8` 做大端字节序转换。
