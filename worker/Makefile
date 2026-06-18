@@ -5,10 +5,13 @@ UNAME := $(shell uname -s)
 ARCH  := $(shell uname -m)
 TARGET := puzzle_worker
 
-# On Apple Silicon / arm64, -march=native does NOT enable the ARMv8 crypto
-# (SHA-256) feature macros that hash.h needs; -mcpu=native does, and keeps
-# all the same tuning. Use it on arm64, plain -march=native elsewhere.
+# On ARM64 (Apple Silicon `arm64`, Linux/Android `aarch64`), -march=native does
+# NOT enable the ARMv8 crypto (SHA-256) feature macros that hash.h needs;
+# -mcpu=native does, and keeps all the same tuning. Use it on either arm64 name,
+# plain -march=native elsewhere.
 ifeq ($(ARCH), arm64)
+    ARCHFLAG := -mcpu=native
+else ifeq ($(ARCH), aarch64)
     ARCHFLAG := -mcpu=native
 else
     ARCHFLAG := -march=native
