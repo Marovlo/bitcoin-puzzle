@@ -166,3 +166,55 @@ CPU 后端（x86, AMD EPYC Zen2）已落地四项，单线程 1.11 → 4.96 MK/s
 > RIPEMD 变量循环移位用 `vshlq_u32(x, vdupq_n_s32(n))` + `vshlq_u32(x, vdupq_n_s32(n-32))` 组合（NEON 负移位量 = 右移）。对称群加每组产出一批点，攒 4 个一组喂给 `pubkey_to_hash160_4way`。
 
 代码参考：`kernels/hash.h`（`sha256_33bytes_arm` / `ripemd160_4way`，分别 gated on `__ARM_FEATURE_SHA2` / `__ARM_NEON`），`backend_cpu.h::search`（work-stealing）。验证：ARM SHA 0/100k mismatch、NEON RMD 0/50k mismatch、`make test` 9/9 + coverage 1872/0。
+
+---
+
+## CUDA 后端优化交接（给下一个 agent / P800·A800·H20）
+
+**写在最前——当前 CUDA kernel 落后整整一代算法。** `kernels/cuda/puzzle_kernel.cu` 的注释写着 "extreme optimization for Hopper"，但那只是 **PTX 微优化**（carry-chain 内联汇编、mul.lo/hi、launch_bounds）。它的**算法仍是最原始的 1 线程 = 1 key**：每个 key 都做一次完整 `scalar_mul_g`（~350 乘）+ 一次完整 `mod_inv`（~270 乘）。
+
+Metal/CPU 已经用**对称群加 + 批量共享求逆**拿到 Metal 12.4x、CPU 算法部分 +118%。**CUDA 完全没移植这个**。所以：
+
+> **CUDA 最大的机会不是 PTX 微调，而是移植对称群加算法。** 预期同数量级提升（5-10x+）。先做这个，PTX 那些已经够好了，微调收益有限。
+
+### 算法移植蓝本（直接照搬，跨语言通用）
+
+参考 `backend_cpu.h::search_incremental` —— 这是干净、已穷举验证的对称群加实现。核心：
+- 每个**线程**负责一个 group（`2H+1` 个连续 key，CPU/Metal 用 H=256/128），中心 C = `center_index·G`
+- 预计算 `i·G` 仿射表（i=1..H），host 端建好传进 GPU（Metal 用 `b_igtable`，CUDA 照做一个 `__device__` 指针或 constant）
+- `C±i·G` 共享同一分母 `den[i]=x(iG)−Cx` → H 个分母**一次批量求逆** → 产出 2H 个点，每点 ~3 乘且直接是仿射坐标
+- degenerate（den[i]=0，小 key 必触发）→ 整组回退逐 key `scalar_mul_g + 单点求逆`
+
+Metal 的落地版见 `kernels/puzzle.metal` 的 `puzzle_search`（含 host 端 `metal_solver.mm` 的 ig_table 构建），CUDA 几乎可一对一翻译。
+
+### ⚠️ 致命坑（已经踩过一次，被回退）
+
+`9e245bf`（"CUDA batch inversion"）曾试图做批量求逆，但 `62f8211` 把它**回退**了。根因：它把 prefix-product / back-propagation **全压给 `tid==0` 单线程串行 + 全块 `__syncthreads()`**，其余线程干等，occupancy 崩盘 → 比原版还慢。
+
+> **正确姿势（Metal 已验证）：每个线程独立负责一整组 key，组内自己串行做批量求逆，线程之间完全不协作、不 `__syncthreads()`、不用 shared memory 跨线程传。** 这样既拿批量求逆的算法收益，又保持高 occupancy。**别再写成跨线程协作版。**
+
+代价是每线程寄存器/local memory 压力大（要存一组的中间量）。Metal 上 H=256 是甜点，CUDA 上 H 可能要调小（寄存器溢出到 local mem 会拖慢）——**H 是第一个要 sweep 的参数**，从 16/32/64 往上试，看 occupancy 与吞吐的平衡。
+
+### 架构 / 编译（P800 / A800 / H20 都适用）
+
+- **算法和整数运算跨 NVIDIA 架构通用**。我们只用 `mul.lo/hi.u64`、`add.cc`/`addc` 这类所有架构都有的基础 PTX，没用 Hopper 专属的 wgmma/TMA/cluster（那些是矩阵乘/AI 用的，与大整数搜索无关）。**在 P800/A800 上调好的代码，搬到 H20 只是 SM 更多跑更快，逻辑一字不改。**
+- **编译目标按卡改**：CMake `-DCMAKE_CUDA_ARCHITECTURES="XX"`：
+  - H20/H100/H800 (Hopper) = `90`
+  - A100/A800 (Ampere) = `80`
+  - P800 → 确认实际架构后填对应 sm（Ampere 系填 80）
+- kernel 里 `__launch_bounds__(256, 4)` 是给 sm_90 调的，换卡后需重新调（occupancy calculator / 实测）。
+- 真正需要大 shared memory / L2 的只有"跨线程协作版批量求逆"——而正确姿势根本不跨线程，所以**不依赖 H20 的大 shared mem**，P800 一样能拿到算法收益。
+
+### 落地前必须先建的安全网（当前缺失！）
+
+**CUDA 目前没有任何正确性测试。** Metal 有 `test_metal_correctness`（区间搜索 + degenerate + 无误报，9/9），CPU 有 `test_coverage`（穷举每偏移）。改 CUDA kernel 前**必须先照 `test_metal_correctness.cpp` 的模式写一个 `test_cuda_correctness`**：把已知 puzzle key 放在 batch 内非零偏移（1/37/1000/65535/1M）处，要求返回精确私钥 + 无误报；尤其覆盖 puzzle1(k=1) 触发 degenerate fallback 的路径。没有这个安全网，对称群加的 degenerate 边界极易漏 key 且测不出来。
+
+### 优化顺序建议
+
+1. 先写 `test_cuda_correctness`（安全网，当前 1 线程 1 key 版应能跑过，作为 golden）
+2. 移植对称群加（最大收益，5-10x+），每步过测试
+3. sweep H（寄存器压力 vs 吞吐）
+4. sweep block size / launch_bounds（按目标卡）
+5. 最后才考虑 PTX 微调 / dedicated mod_sqr（注意：Metal 上 dedicated mod_sqr 是**负优化**，GPU 不喜欢分支型进位传播——CUDA 上大概率同理，别抱期望）
+
+实测口径：连协调者跑真实任务看 per-task `MK/s`（GK/s），**不要信启动时的 init benchmark**（它从 key=1 开始，落在 degenerate 区，数字偏低不准）。
