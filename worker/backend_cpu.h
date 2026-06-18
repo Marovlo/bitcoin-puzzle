@@ -47,16 +47,41 @@ public:
         uint8_t target_copy[20];
         memcpy(target_copy, target_h160, 20);
 
-        uint64_t chunk_per_thread = size / num_threads_;
+        // Dynamic work-stealing instead of static even split. Apple Silicon is
+        // heterogeneous (e.g. M3 Pro = 6 performance + 6 efficiency cores); an
+        // even split makes fast P-cores idle while slow E-cores finish their
+        // equal share, so wall-clock is bounded by the slowest core. Here the
+        // range is carved into many fixed-size tiles handed out via one atomic
+        // counter: P-cores naturally claim more tiles, E-cores fewer, and total
+        // throughput (not the slowest core) sets the pace.
+        //
+        // Tile size is a whole number of GROUP_SIZE blocks so each tile starts
+        // on a fresh group (the center is recomputed per search_incremental
+        // call anyway). ~8 tiles/thread balances load without oversplitting.
+        uint64_t tile = (uint64_t)GROUP_SIZE * 64;            // keys per tile
+        uint64_t num_tiles = (size + tile - 1) / tile;
+        if (num_tiles < (uint64_t)num_threads_ * 4 && size > 0) {
+            // Few keys: shrink tiles so every thread still gets work.
+            tile = ((size / ((uint64_t)num_threads_ * 4) / GROUP_SIZE) + 1)
+                   * (uint64_t)GROUP_SIZE;
+            if (tile == 0) tile = GROUP_SIZE;
+            num_tiles = (size + tile - 1) / tile;
+        }
+
+        std::atomic<uint64_t> next_tile{0};
         std::vector<std::thread> threads;
-
         for (int t = 0; t < num_threads_; t++) {
-            uint64_t t_offset = (uint64_t)t * chunk_per_thread;
-            uint64_t t_size = (t == num_threads_ - 1) ? (size - t_offset) : chunk_per_thread;
-
-            threads.emplace_back([&, t_offset, t_size]() {
-                search_incremental(start_lo, start_hi, t_offset, t_size,
-                                   target_copy, found, result_lo, result_hi);
+            threads.emplace_back([&]() {
+                for (;;) {
+                    if (found.load(std::memory_order_relaxed)) return;
+                    if (g_stop_flag && !g_stop_flag->load(std::memory_order_relaxed)) return;
+                    uint64_t idx = next_tile.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= num_tiles) return;
+                    uint64_t t_offset = idx * tile;
+                    uint64_t t_size = std::min(tile, size - t_offset);
+                    search_incremental(start_lo, start_hi, t_offset, t_size,
+                                       target_copy, found, result_lo, result_hi);
+                }
             });
         }
         for (auto& th : threads) th.join();
