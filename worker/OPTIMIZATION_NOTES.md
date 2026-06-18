@@ -110,3 +110,39 @@ CPU 后端（x86, AMD EPYC Zen2）已落地四项，单线程 1.11 → 4.96 MK/s
 历史教训：`9e245bf` 曾在 **CUDA** 上试过批量求逆但被回退（`62f8211`），根因是把 prefix product / back-propagation **全压给 tid==0 单线程串行 + 全块 `__syncthreads()`**，occupancy 崩盘。Metal 现在"每线程独立负责一组 key、组内自己串行求逆、不跨线程协作"的做法**恰好避开了这个坑**——这是正确姿势，别改成跨线程协作版。
 
 代码参考：`backend_cpu.h`（`search_incremental` = 对称群加 + 退化 fallback + 跨组推进），`test_coverage.cpp`（穷举每个偏移的覆盖测试）。
+
+---
+
+## Mac CPU (Apple Silicon / ARM) 优化
+
+针对 M3 Pro（6 性能核 + 6 能效核）的专项优化。**关键结论：x86 的三个优化（SHA-NI / AVX2 / MULX-ADX）是指令集专属内联汇编/intrinsics，在 ARM 上条件编译全部 fallback 到标量，无法直接复用——必须重写 ARM 等价版。** 实测（真实 worker，全核）约 18 → 46 MK/s（~2.5x）。
+
+| 优化 | 类型 | 效果 | commit |
+|------|------|------|--------|
+| work-stealing 负载均衡 | 调度（异构核） | 修正能效核拖尾 | opt-cpu-arm |
+| ARMv8 SHA-256 硬件指令 | ARM 专属 | 单核 +60% | opt-cpu-arm |
+| NEON 4 路 RIPEMD-160 | ARM 专属 | 哈希 2.53x，整体再 +38% | opt-cpu-arm |
+
+吞吐（微基准 real backend_cpu，高位 key）：
+
+| 线程 | baseline | +work-steal | +ARM SHA | +NEON RMD |
+|------|----------|-------------|----------|-----------|
+| 1 | 2.31 | 2.31 | 3.69 | **5.90** |
+| 6 | 12.85 | 13.08 | 19.92 | **30.79** |
+| 12 | 18.30 | 19.07 | 31.09 | **42.90** |
+
+### 关键经验（踩过的坑）
+
+> **(A) `-march=native` 在 Apple clang 的 arm64 上 _不_ 启用 crypto 特性宏。**
+> 这是最隐蔽的坑：`__ARM_FEATURE_SHA2` / `__ARM_NEON` 在裸 clang 默认 target 下有，但加了 `-march=native` 反而消失，导致 ARM SHA 路径永远走不到。必须用 **`-mcpu=native`**（保留全部 native 调优 + 启用 crypto）。Makefile 已按 `uname -m == arm64` 切换。验证：`echo | clang++ -mcpu=native -dM -E -x c++ - | grep ARM_FEATURE_SHA2`。
+
+> **(B) 异构 P/E 核：静态均分是错的。**
+> 原 `backend_cpu` 把 chunk 平均切 N 份，总耗时被最慢的能效核拖住（性能核算完空等）。改为原子计数器分发 GROUP_SIZE 对齐的小 tile（work-stealing），性能核自然多抢。扩展比从 ~6 线程后塌陷恢复到 12 线程 ~8x。
+
+> **(C) ARM SHA-256 结构比 x86 SHA-NI 干净。**
+> 无需 x86 那套 state shuffle（abef/cdgh 重排）。直接 `vsha256hq_u32` + `vsha256h2q_u32` 配对，`vsha256su0/su1` 做消息扩展，load/store 用 `vrev32q_u8` 做大端字节序转换。
+
+> **(D) NEON 只有 128-bit → 4 路（x86 AVX2 是 256-bit → 8 路）。**
+> RIPEMD 变量循环移位用 `vshlq_u32(x, vdupq_n_s32(n))` + `vshlq_u32(x, vdupq_n_s32(n-32))` 组合（NEON 负移位量 = 右移）。对称群加每组产出一批点，攒 4 个一组喂给 `pubkey_to_hash160_4way`。
+
+代码参考：`kernels/hash.h`（`sha256_33bytes_arm` / `ripemd160_4way`，分别 gated on `__ARM_FEATURE_SHA2` / `__ARM_NEON`），`backend_cpu.h::search`（work-stealing）。验证：ARM SHA 0/100k mismatch、NEON RMD 0/50k mismatch、`make test` 9/9 + coverage 1872/0。
