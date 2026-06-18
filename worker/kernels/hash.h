@@ -7,6 +7,11 @@
   #include <immintrin.h>
 #endif
 
+#if defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO)
+  #define HASH_HAVE_ARM_SHA2 1
+  #include <arm_neon.h>
+#endif
+
 namespace hash {
 
 // --- SHA-256 for exactly 33 bytes (compressed pubkey) ---
@@ -268,10 +273,85 @@ inline void sha256_33bytes_shani(const uint8_t pubkey[33], uint8_t hash[32]) {
 }
 #endif // HASH_HAVE_SHANI
 
-// Dispatch: use SHA-NI when compiled in, else portable scalar.
+#ifdef HASH_HAVE_ARM_SHA2
+// SHA-256 of exactly 33 bytes using ARMv8 crypto extension (single 64-byte
+// block). One message schedule + 64 rounds via vsha256hq/h2q + su0/su1.
+inline void sha256_33bytes_arm(const uint8_t pubkey[33], uint8_t hash[32]) {
+    // Padded 64-byte block: 33 message bytes, 0x80, zero pad, 64-bit BE length.
+    alignas(16) uint8_t block[64];
+    memcpy(block, pubkey, 33);
+    block[33] = 0x80;
+    memset(block + 34, 0, 64 - 34);
+    block[62] = 0x01;   // length = 264 bits = 0x108
+    block[63] = 0x08;
+
+    // Load 4 message vectors, byte-swap each 32-bit word to big-endian.
+    uint32x4_t m0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 0)));
+    uint32x4_t m1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 16)));
+    uint32x4_t m2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 32)));
+    uint32x4_t m3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 48)));
+
+    // Initial state {A,B,C,D}, {E,F,G,H}.
+    uint32x4_t s0 = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a};
+    uint32x4_t s1 = {0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    const uint32x4_t abef0 = s0, cdgh0 = s1;
+
+    uint32x4_t k, t;
+    // Helper macro: one group of 4 rounds with state update.
+    #define RND4(MSG, KIDX) do {                                  \
+        k = vld1q_u32(&SHA256_K[(KIDX)]);                         \
+        uint32x4_t w = vaddq_u32((MSG), k);                       \
+        uint32x4_t s0o = s0;                                      \
+        s0 = vsha256hq_u32(s0, s1, w);                            \
+        s1 = vsha256h2q_u32(s1, s0o, w);                          \
+    } while (0)
+
+    // schedule + rounds, interleaved (su0/su1 produce next msg vectors)
+    RND4(m0, 0);
+    uint32x4_t n0 = vsha256su1q_u32(vsha256su0q_u32(m0, m1), m2, m3);
+    RND4(m1, 4);
+    uint32x4_t n1 = vsha256su1q_u32(vsha256su0q_u32(m1, m2), m3, n0);
+    RND4(m2, 8);
+    uint32x4_t n2 = vsha256su1q_u32(vsha256su0q_u32(m2, m3), n0, n1);
+    RND4(m3, 12);
+    uint32x4_t n3 = vsha256su1q_u32(vsha256su0q_u32(m3, n0), n1, n2);
+    RND4(n0, 16);
+    m0 = vsha256su1q_u32(vsha256su0q_u32(n0, n1), n2, n3);
+    RND4(n1, 20);
+    m1 = vsha256su1q_u32(vsha256su0q_u32(n1, n2), n3, m0);
+    RND4(n2, 24);
+    m2 = vsha256su1q_u32(vsha256su0q_u32(n2, n3), m0, m1);
+    RND4(n3, 28);
+    m3 = vsha256su1q_u32(vsha256su0q_u32(n3, m0), m1, m2);
+    RND4(m0, 32);
+    n0 = vsha256su1q_u32(vsha256su0q_u32(m0, m1), m2, m3);
+    RND4(m1, 36);
+    n1 = vsha256su1q_u32(vsha256su0q_u32(m1, m2), m3, n0);
+    RND4(m2, 40);
+    n2 = vsha256su1q_u32(vsha256su0q_u32(m2, m3), n0, n1);
+    RND4(m3, 44);
+    n3 = vsha256su1q_u32(vsha256su0q_u32(m3, n0), n1, n2);
+    RND4(n0, 48);
+    RND4(n1, 52);
+    RND4(n2, 56);
+    RND4(n3, 60);
+    #undef RND4
+
+    s0 = vaddq_u32(s0, abef0);
+    s1 = vaddq_u32(s1, cdgh0);
+
+    // Byte-swap back to big-endian and store.
+    vst1q_u8(hash + 0,  vrev32q_u8(vreinterpretq_u8_u32(s0)));
+    vst1q_u8(hash + 16, vrev32q_u8(vreinterpretq_u8_u32(s1)));
+}
+#endif // HASH_HAVE_ARM_SHA2
+
+// Dispatch: use SHA-NI / ARMv8-SHA2 when compiled in, else portable scalar.
 inline void sha256_33bytes(const uint8_t pubkey[33], uint8_t hash[32]) {
-#ifdef HASH_HAVE_SHANI
+#if defined(HASH_HAVE_SHANI)
     sha256_33bytes_shani(pubkey, hash);
+#elif defined(HASH_HAVE_ARM_SHA2)
+    sha256_33bytes_arm(pubkey, hash);
 #else
     sha256_33bytes_scalar(pubkey, hash);
 #endif
