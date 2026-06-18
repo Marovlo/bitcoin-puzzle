@@ -7,9 +7,16 @@
   #include <immintrin.h>
 #endif
 
+// Pull in NEON intrinsics whenever NEON is available — the 4-way RIPEMD path
+// below is gated on __ARM_NEON alone, independent of the crypto (SHA2) feature.
+// (A "-march=armv8-a" build has NEON but not crypto; gating the include on the
+// crypto macro left uint32x4_t undefined there.)
+#if defined(__ARM_NEON) || defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO)
+  #include <arm_neon.h>
+#endif
+
 #if defined(__ARM_FEATURE_SHA2) || defined(__ARM_FEATURE_CRYPTO)
   #define HASH_HAVE_ARM_SHA2 1
-  #include <arm_neon.h>
 #endif
 
 namespace hash {
