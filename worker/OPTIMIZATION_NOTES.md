@@ -7,7 +7,8 @@ worker 在各后端的优化进度、方法与踩过的坑。**所有性能数�
 | 后端 | baseline | 当前 | 加速 | 设备 |
 |------|----------|------|------|------|
 | Metal | 14.5 MK/s | **180 MK/s** | 12.4x | Apple M3 Pro |
-| CPU (ARM) | ~18 MK/s | **46 MK/s** | 2.5x | M3 Pro 12 线程 |
+| CPU (ARM, Mac) | ~18 MK/s | **46 MK/s** | 2.5x | M3 Pro 12 线程 |
+| CPU (ARM, Android) | 9 MK/s | **18 MK/s** | 2.0x | 小米15 / 骁龙8至尊版 8 线程（真机实测） |
 | CPU (x86) | 8.8 MK/s | **39 MK/s** | 4.5x | AMD EPYC Zen2 8 核 |
 | CUDA | 未优化 | 未优化 | — | 算法落后一代，见 §3 |
 
@@ -91,6 +92,8 @@ H 越大，求逆和 scalar_mul 摊得越薄；但每线程要存一组中间量
 > **(C) NEON 只有 128-bit → 4 路（x86 AVX2 是 256-bit → 8 路）。** RIPEMD 变量循环移位用 `vshlq_u32(x, vdupq_n_s32(n))` + `vshlq_u32(x, vdupq_n_s32(n-32))` 组合（NEON 负移位量 = 右移）。对称群加每组产点，攒 4 个一组喂给 `pubkey_to_hash160_4way`。
 
 代码：`kernels/hash.h`（`sha256_33bytes_arm` / `ripemd160_4way`，gated on `__ARM_FEATURE_SHA2` / `__ARM_NEON`）。验证：ARM SHA 0/100k mismatch、NEON RMD 0/50k mismatch。
+
+> **同一套代码已在 Android (Termux) 真机验证。** 小米15（骁龙8至尊版，2 超大核 + 6 大核）实测：标量版 9 → 优化版 **18 MK/s（2.0x）**，单核 2.7 → 8 核 18（6.7x 扩展）。说明 §1 算法 + ARM SHA2/NEON 哈希在所有 ARMv8 crypto 设备通用，零算法改动。两个移植坑：(1) Makefile 要认 `aarch64`（不只 Apple 的 `arm64`），否则走 `-march=native` 丢掉 crypto；(2) `arm_neon.h` 的 include 要 gate 在 `__ARM_NEON` 上（不能只在 crypto 宏下），否则 NEON-without-crypto 构建报 `uint32x4_t` 未定义。两者均已修。手机为散热受限设备，18 MK/s 是可持续稳态。
 
 ## 2.2 x86 CPU — 已落地 4.5x
 
