@@ -540,4 +540,97 @@ inline void pubkey_to_hash160_8way(const uint8_t pubkeys[8][33], uint8_t h160[8]
 }
 #endif // HASH_HAVE_AVX2_RMD
 
+#if defined(__ARM_NEON)
+  #define HASH_HAVE_NEON_RMD 1
+
+// --- NEON 4-way RIPEMD-160 over 4 independent 32-byte inputs ---
+// Direct analogue of the AVX2 8-way path: same padded-block layout
+// (word[8]=0x80, word[14]=256-bit length), 4 lanes instead of 8.
+inline uint32x4_t rmd_f0_v4(uint32x4_t x, uint32x4_t y, uint32x4_t z) { return veorq_u32(veorq_u32(x, y), z); }
+inline uint32x4_t rmd_f1_v4(uint32x4_t x, uint32x4_t y, uint32x4_t z) { return vorrq_u32(vandq_u32(x, y), vbicq_u32(z, x)); }
+inline uint32x4_t rmd_f2_v4(uint32x4_t x, uint32x4_t y, uint32x4_t z) { return veorq_u32(vorrq_u32(x, vmvnq_u32(y)), z); }
+inline uint32x4_t rmd_f3_v4(uint32x4_t x, uint32x4_t y, uint32x4_t z) { return vorrq_u32(vandq_u32(x, z), vbicq_u32(y, z)); }
+inline uint32x4_t rmd_f4_v4(uint32x4_t x, uint32x4_t y, uint32x4_t z) { return veorq_u32(x, vorrq_u32(y, vmvnq_u32(z))); }
+
+inline void ripemd160_4way(const uint8_t in[4][32], uint8_t out[4][20]) {
+    // Rotate-left by a compile-time constant per round step.
+    #define ROTL_V4(x, n) vorrq_u32(vshlq_n_u32((x), (n)), vshrq_n_u32((x), 32 - (n)))
+
+    uint32x4_t X[16];
+    uint32_t w[4][8];
+    for (int m = 0; m < 4; m++)
+        for (int j = 0; j < 8; j++)
+            w[m][j] = (uint32_t)in[m][j*4] | ((uint32_t)in[m][j*4+1] << 8)
+                    | ((uint32_t)in[m][j*4+2] << 16) | ((uint32_t)in[m][j*4+3] << 24);
+    for (int j = 0; j < 8; j++) {
+        uint32_t lane[4] = {w[0][j], w[1][j], w[2][j], w[3][j]};
+        X[j] = vld1q_u32(lane);
+    }
+    X[8] = vdupq_n_u32(0x00000080u);
+    for (int j = 9; j < 14; j++) X[j] = vdupq_n_u32(0);
+    X[14] = vdupq_n_u32(256u);
+    X[15] = vdupq_n_u32(0);
+
+    const uint32x4_t I0 = vdupq_n_u32(0x67452301), I1 = vdupq_n_u32(0xEFCDAB89),
+                     I2 = vdupq_n_u32(0x98BADCFE), I3 = vdupq_n_u32(0x10325476),
+                     I4 = vdupq_n_u32(0xC3D2E1F0);
+    uint32x4_t AL = I0, BL = I1, CL = I2, DL = I3, EL = I4;
+    uint32x4_t AR = I0, BR = I1, CR = I2, DR = I3, ER = I4;
+
+    for (int round = 0; round < 5; round++) {
+        uint32x4_t KLr = vdupq_n_u32(RMD_KL[round]);
+        uint32x4_t KRr = vdupq_n_u32(RMD_KR[round]);
+        for (int j = round * 16; j < (round + 1) * 16; j++) {
+            uint32x4_t fl, fr;
+            switch (round) {
+                case 0: fl = rmd_f0_v4(BL,CL,DL); fr = rmd_f4_v4(BR,CR,DR); break;
+                case 1: fl = rmd_f1_v4(BL,CL,DL); fr = rmd_f3_v4(BR,CR,DR); break;
+                case 2: fl = rmd_f2_v4(BL,CL,DL); fr = rmd_f2_v4(BR,CR,DR); break;
+                case 3: fl = rmd_f3_v4(BL,CL,DL); fr = rmd_f1_v4(BR,CR,DR); break;
+                default: fl = rmd_f4_v4(BL,CL,DL); fr = rmd_f0_v4(BR,CR,DR);
+            }
+            uint32x4_t tL = vaddq_u32(AL, fl);
+            tL = vaddq_u32(tL, X[RMD_RL[j]]); tL = vaddq_u32(tL, KLr);
+            // variable rotate by RMD_SL[j]: use vshlq with signed counts
+            int sl = RMD_SL[j];
+            tL = vaddq_u32(vorrq_u32(vshlq_u32(tL, vdupq_n_s32(sl)),
+                                     vshlq_u32(tL, vdupq_n_s32(sl - 32))), EL);
+            AL = EL; EL = DL; DL = ROTL_V4(CL, 10); CL = BL; BL = tL;
+            uint32x4_t tR = vaddq_u32(AR, fr);
+            tR = vaddq_u32(tR, X[RMD_RR[j]]); tR = vaddq_u32(tR, KRr);
+            int sr = RMD_SR[j];
+            tR = vaddq_u32(vorrq_u32(vshlq_u32(tR, vdupq_n_s32(sr)),
+                                     vshlq_u32(tR, vdupq_n_s32(sr - 32))), ER);
+            AR = ER; ER = DR; DR = ROTL_V4(CR, 10); CR = BR; BR = tR;
+        }
+    }
+
+    uint32x4_t H0 = vaddq_u32(vaddq_u32(I1, CL), DR);
+    uint32x4_t H1 = vaddq_u32(vaddq_u32(I2, DL), ER);
+    uint32x4_t H2 = vaddq_u32(vaddq_u32(I3, EL), AR);
+    uint32x4_t H3 = vaddq_u32(vaddq_u32(I4, AL), BR);
+    uint32x4_t H4 = vaddq_u32(vaddq_u32(I0, BL), CR);
+    uint32_t h0[4], h1[4], h2[4], h3[4], h4[4];
+    vst1q_u32(h0, H0); vst1q_u32(h1, H1); vst1q_u32(h2, H2);
+    vst1q_u32(h3, H3); vst1q_u32(h4, H4);
+    for (int m = 0; m < 4; m++) {
+        uint32_t H[5] = {h0[m], h1[m], h2[m], h3[m], h4[m]};
+        for (int i = 0; i < 5; i++) {
+            out[m][i*4]   = (uint8_t)(H[i]);
+            out[m][i*4+1] = (uint8_t)(H[i] >> 8);
+            out[m][i*4+2] = (uint8_t)(H[i] >> 16);
+            out[m][i*4+3] = (uint8_t)(H[i] >> 24);
+        }
+    }
+    #undef ROTL_V4
+}
+
+// 4 compressed pubkeys -> 4 hash160 (SHA-256 each, then one 4-way RIPEMD-160).
+inline void pubkey_to_hash160_4way(const uint8_t pubkeys[4][33], uint8_t h160[4][20]) {
+    uint8_t sha[4][32];
+    for (int m = 0; m < 4; m++) sha256_33bytes(pubkeys[m], sha[m]);
+    ripemd160_4way(sha, h160);
+}
+#endif // HASH_HAVE_NEON_RMD
+
 }  // namespace hash

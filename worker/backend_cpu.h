@@ -298,6 +298,17 @@ private:
                 for (int k = 0; k < 8; k++)
                     if (report_if_match(h160s[k], g_start + m + k)) return;
             }
+#elif defined(HASH_HAVE_NEON_RMD)
+            uint8_t pubkeys[4][33];
+            for (; m + 4 <= span; m += 4) {
+                if (found.load(std::memory_order_relaxed)) return;
+                for (int k = 0; k < 4; k++)
+                    write_pubkey(ax[m + k], ay[m + k], pubkeys[k]);
+                uint8_t h160s[4][20];
+                hash::pubkey_to_hash160_4way(pubkeys, h160s);
+                for (int k = 0; k < 4; k++)
+                    if (report_if_match(h160s[k], g_start + m + k)) return;
+            }
 #endif
             for (; m < span; m++) {
                 uint8_t pk[33], h160[20];
