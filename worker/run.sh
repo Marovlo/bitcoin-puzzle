@@ -80,4 +80,5 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
 fi
 
 echo "==> Joining pool (Ctrl+C to stop)"
-exec ./puzzle_worker "${PASSTHROUGH[@]}"
+# Expand the array safely even when empty under `set -u` on bash 3.2 (macOS).
+exec ./puzzle_worker ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
