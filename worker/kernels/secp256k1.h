@@ -419,4 +419,37 @@ inline void scalar_mul_g_windowed(JacobianPoint& r, const uint64_t scalar[4],
     }
 }
 
+// Affine table used by the symmetric group search (CPU and GPU backends).
+//
+// A "group" spans GROUP_SIZE = 2*H+1 consecutive keys centred on C. Because the
+// affine multiples i*G are precomputed, C+i*G and C-i*G share the same
+// x-difference, so a single modular inverse per group yields both points.
+//
+// Layout, 8 ulongs (X[4] then Y[4]) per entry:
+//   entry 0        : (2*H+1)*G, used to advance the centre between groups
+//   entry i, 1..H  : i*G
+// Caller must supply (H + 1) * 8 ulongs.
+inline void build_group_table(uint64_t* out, int H, const uint64_t* g_table) {
+    auto affinize = [](const JacobianPoint& P, uint64_t ax[4], uint64_t ay[4]) {
+        uint64_t zi[4], zi2[4], zi3[4];
+        mod_inv(zi, P.Z);
+        mod_sqr(zi2, zi);
+        mod_mul(zi3, zi2, zi);
+        mod_mul(ax, P.X, zi2);
+        mod_mul(ay, P.Y, zi3);
+    };
+
+    for (int i = 1; i <= H; ++i) {
+        uint64_t k[4] = {(uint64_t)i, 0, 0, 0};
+        JacobianPoint P;
+        scalar_mul_g_windowed(P, k, g_table);
+        affinize(P, &out[(size_t)i * 8], &out[(size_t)i * 8 + 4]);
+    }
+
+    uint64_t ks[4] = {(uint64_t)(2 * H + 1), 0, 0, 0};
+    JacobianPoint S;
+    scalar_mul_g_windowed(S, ks, g_table);
+    affinize(S, &out[0], &out[4]);
+}
+
 }  // namespace secp256k1

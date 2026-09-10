@@ -21,6 +21,9 @@
 #ifdef USE_CUDA
 #include "backend_cuda.h"
 #endif
+#ifdef USE_OPENCL
+#include "backend_opencl.h"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -298,6 +301,8 @@ int main(int argc, char** argv) {
     gethostname_compat(hname, sizeof(hname));
 
     bool test_mode = false;
+    bool list_devices = false;
+    bool bench_only = false;
     int cpu_threads = 0;        // 0 = auto
     uint64_t metal_batch = 0;   // 0 = default (4M)
 
@@ -314,17 +319,33 @@ int main(int argc, char** argv) {
             metal_batch = strtoull(argv[++i], nullptr, 10);
         else if (strcmp(argv[i], "--test") == 0 || strcmp(argv[i], "-t") == 0)
             test_mode = true;
+        else if (strcmp(argv[i], "--list-devices") == 0)
+            list_devices = true;
+        else if (strcmp(argv[i], "--bench") == 0)
+            bench_only = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("  -u, --url URL          Coordinator URL (default: http://81.70.166.231:8080)\n");
-            printf("  -b, --backend NAME     Backend: auto, metal, cpu, cuda (default: auto)\n");
+            printf("  -b, --backend NAME     Backend: auto, metal, cpu, cuda, hip, opencl (default: auto)\n");
             printf("      --id ID            Worker ID (default: random)\n");
             printf("      --cpu-threads N    CPU thread count (default: all cores)\n");
             printf("      --metal-batch N    Metal keys per dispatch (default: 4000000)\n");
+            printf("      --list-devices     List available GPU devices and exit\n");
+            printf("      --bench            Benchmark backends and exit (no pool connection)\n");
             printf("  -t, --test             Run self-test and exit\n");
             printf("  -h, --help             Show help\n");
             return 0;
         }
+    }
+
+    if (list_devices) {
+        printf("=== Available GPU devices ===\n");
+#ifdef USE_OPENCL
+        printf("OpenCL:\n%s", OpenCLSolver::list_devices().c_str());
+#else
+        printf("(built without OpenCL support)\n");
+#endif
+        return 0;
     }
 
     // Init backend
@@ -349,6 +370,10 @@ int main(int argc, char** argv) {
     } else if (backend_name == "hip") {
         backend = std::make_unique<HIPBackend>(0);
 #endif
+#ifdef USE_OPENCL
+    } else if (backend_name == "opencl" || backend_name == "ocl") {
+        backend = std::make_unique<OpenCLBackend>(0);
+#endif
     } else {
         printf("[!] Unknown backend: %s\n", backend_name.c_str());
         printf("    Available: auto, cpu");
@@ -360,6 +385,9 @@ int main(int argc, char** argv) {
 #endif
 #ifdef USE_HIP
         printf(", hip");
+#endif
+#ifdef USE_OPENCL
+        printf(", opencl");
 #endif
         printf("\n");
         return 1;
@@ -376,6 +404,20 @@ int main(int argc, char** argv) {
     // Benchmark
     uint64_t rate = backend->benchmark(50000);
     printf("  Speed:     %.2f MKeys/s\n", rate / 1e6);
+
+    // ========== BENCH MODE ==========
+    // Measures throughput without ever contacting a coordinator.
+    if (bench_only) {
+        printf("\n--- Benchmark ---\n");
+        const uint64_t sample = 50'000'000ull;
+        auto t0 = std::chrono::steady_clock::now();
+        const uint64_t r = backend->benchmark(sample);
+        auto t1 = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+        printf("  %llu keys in %.2fs -> %.2f MKeys/s\n",
+               (unsigned long long)sample, elapsed, r / 1e6);
+        return 0;
+    }
 
     // ========== TEST MODE ==========
     if (test_mode) {

@@ -2,7 +2,7 @@
 
 分布式比特币 puzzle 暴力搜索矿池。学习 secp256k1、GPU 计算、分布式系统的教学项目。
 
-一个 **coordinator**（Go）分发搜索区间，任意数量的 **worker**（C++，支持 Metal / CUDA / HIP / CPU）领取区间、计算、提交结果。下面教你在自己的设备上把 worker 跑起来，加入公共池。
+一个 **coordinator**（Go）分发搜索区间，任意数量的 **worker**（C++，支持 Metal / CUDA / HIP / OpenCL / CPU）领取区间、计算、提交结果。下面教你在自己的设备上把 worker 跑起来，加入公共池。
 
 ---
 
@@ -49,9 +49,22 @@ cd bitcoin-puzzle/worker
 ./run.sh                      # 无 GPU 工具链 -> CPU 多线程构建
 ```
 
-### Windows（NVIDIA / CPU）
+### Windows（AMD / NVIDIA / Intel GPU + CPU）
 
-走 CMake + Visual Studio，步骤见 [worker/BUILD_WINDOWS.md](worker/BUILD_WINDOWS.md)。
+Windows 上走 **OpenCL**：runtime 随显卡驱动安装，**不需要任何 GPU SDK**（kernel 由驱动在运行时编译）。
+AMD 显卡尤其需要这条路——AMD 的 HIP SDK for Windows 官方只支持 RDNA3 及以上，RX 6000 系列（RDNA2）装 HIP 也没用。
+
+```powershell
+winget install BrechtSanders.WinLibs.POSIX.UCRT   # 只要一个 C++ 编译器
+git clone https://github.com/Marovlo/bitcoin-puzzle.git
+cd bitcoin-puzzle/worker
+.\build_windows.ps1                                # 构建
+.\build\puzzle_worker.exe --list-devices           # 确认驱动被识别
+.\build\puzzle_worker.exe --backend auto --bench   # 测速（不连池）
+.\build\puzzle_worker.exe                          # 正式加入公共池
+```
+
+详见 [worker/BUILD_WINDOWS.md](worker/BUILD_WINDOWS.md)。
 
 > `run.sh` 会自动检测平台与 GPU、选对构建方式（Metal/CPU 用 Makefile，CUDA/HIP 用 CMake），编译后直接加入公共池。Ctrl+C 停止。
 
@@ -84,10 +97,12 @@ curl http://81.70.166.231:8080/api/stats
 `run.sh` 把额外参数透传给 `puzzle_worker`，常用的：
 
 ```bash
-./run.sh --backend metal        # 强制后端：auto(默认) | metal | cpu | cuda | hip
+./run.sh --backend metal        # 强制后端：auto(默认) | metal | cpu | cuda | hip | opencl
 ./run.sh --backend cpu --cpu-threads 16   # 限制 CPU 线程数
 ./run.sh --url http://其他主机:8080        # 连别的协调者
 ./puzzle_worker --help          # 查看全部参数
+./puzzle_worker --bench         # 只测速，不连协调者
+./puzzle_worker --list-devices  # 列出可用的 OpenCL GPU
 ```
 
 默认 `--backend auto`（=`multi`）同时使用 GPU + CPU。更多用法、各 GPU 构建细节、调参见 [worker/README.md](worker/README.md)。
@@ -107,6 +122,10 @@ curl http://81.70.166.231:8080/api/stats
 | RTX 4090 | CUDA | ~2000-5000 MK/s |
 | RTX 3070 Ti Laptop | CUDA | ~800-1500 MK/s |
 | Apple M3 Pro | Metal+CPU | ~225 MK/s |
+| RX 6800 XT (Windows) | OpenCL+CPU | ~780 MK/s |
+
+RX 6800 XT 实测拆解：OpenCL GPU ~650 MK/s、CPU 16 线程 ~63 MK/s，`--backend auto` 两者并行 ~780 MK/s
+（同一张卡上，未优化的朴素 GPU 实现只有 ~43 MK/s）。
 
 > 数值为实测（连协调者跑真实任务，非启动时的 init benchmark）。GPU/CPU 的优化历程与方法见 [worker/OPTIMIZATION_NOTES.md](worker/OPTIMIZATION_NOTES.md)：
 > - **Metal**：增量点加 + Montgomery 批量求逆 + 对称群加 C±i·G，14.5 → 180 MK/s（12.4x）
@@ -176,11 +195,12 @@ bitcoin-puzzle/
 │   └── main.go
 ├── worker/              # worker（C++）：多后端搜索
 │   ├── run.sh           # 一键构建+运行（macOS/Linux）
+│   ├── build_windows.ps1# 一键构建+测试（Windows, OpenCL）
 │   ├── README.md        # worker 详细文档
 │   ├── main.cpp         # pipeline 主程序
-│   ├── backend_*.h      # multi / metal / cpu / cuda / hip 后端
+│   ├── backend_*.h      # multi / metal / cpu / cuda / hip / opencl 后端
 │   ├── Makefile         # Metal/CPU 构建 + 测试
-│   ├── CMakeLists.txt   # CUDA/HIP 构建
+│   ├── CMakeLists.txt   # CUDA/HIP/OpenCL 构建
 │   ├── OPTIMIZATION_NOTES.md
 │   └── kernels/         # secp256k1 / hash / 各平台 GPU kernel
 ├── puzzles.json         # puzzle 数据

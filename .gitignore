@@ -6,6 +6,12 @@ puzzle_coordinator
 puzzle_solver
 verify_correctness
 puzzle_metal_source.inc
+puzzle_opencl_source.inc
+
+# Build output
+build/
+build-*/
+*.exe
 
 # Test/bench harness binaries
 test_sqr

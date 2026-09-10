@@ -10,6 +10,9 @@
 #ifdef USE_HIP
 #include "backend_hip.h"
 #endif
+#ifdef USE_OPENCL
+#include "backend_opencl.h"
+#endif
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -19,6 +22,7 @@
 
 // Multi-device backend: uses ALL available compute on the machine.
 // On macOS: Metal GPU + CPU threads (the GPU doesn't use all CPU, so both run)
+// On Windows/AMD: OpenCL GPU + CPU threads
 // Strategy: split each task proportionally to measured device speeds.
 class MultiBackend : public ComputeBackend {
 public:
@@ -44,6 +48,16 @@ public:
             if (hip->init()) {
                 devices_.push_back({std::move(hip), 0, "hip"});
                 printf("  [+] HIP GPU: available\n");
+            }
+        }
+#endif
+
+#ifdef USE_OPENCL
+        {
+            auto ocl = std::make_unique<OpenCLBackend>(0);
+            if (ocl->init()) {
+                devices_.push_back({std::move(ocl), 0, "opencl"});
+                printf("  [+] OpenCL GPU: available\n");
             }
         }
 #endif
@@ -151,9 +165,22 @@ public:
     }
 
     uint64_t benchmark(uint64_t sample_size) override {
-        // Combined rate
+        // A small sample (the 50K warm-up call in main) reuses the per-device
+        // rates measured in init(); a large one triggers a genuine
+        // re-measurement so a --bench run reports real throughput rather than a
+        // cached number.
+        if (sample_size <= 200000) {
+            uint64_t cached = 0;
+            for (auto& d : devices_) cached += d.rate;
+            return cached;
+        }
+
         uint64_t total = 0;
-        for (auto& d : devices_) total += d.rate;
+        const uint64_t share = sample_size / devices_.size();
+        for (auto& d : devices_) {
+            d.rate = d.backend->benchmark(share);
+            total += d.rate;
+        }
         return total;
     }
 

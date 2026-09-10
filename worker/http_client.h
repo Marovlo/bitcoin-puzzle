@@ -60,10 +60,10 @@ private:
     std::string base_url_;
     std::string host_;
     int port_ = 80;
-    int fd_ = -1;
+    socket_t fd_ = kInvalidSocket;
 
     bool ensure_connected() {
-        if (fd_ >= 0) return true;
+        if (fd_ != kInvalidSocket) return true;
 
         struct addrinfo hints{}, *res;
         hints.ai_family = AF_INET;
@@ -74,22 +74,20 @@ private:
         if (getaddrinfo(host_.c_str(), port_str, &hints, &res) != 0) return false;
 
         fd_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (fd_ < 0) { freeaddrinfo(res); return false; }
+        if (fd_ == kInvalidSocket) { freeaddrinfo(res); return false; }
 
-        // Set timeout
-        struct timeval tv = {5, 0}; // 5s timeout
-        setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        // 5s timeout on both directions
+        socket_set_timeout(fd_, 5);
 
-        if (connect(fd_, res->ai_addr, res->ai_addrlen) < 0) {
-            close(fd_); fd_ = -1; freeaddrinfo(res); return false;
+        if (connect(fd_, res->ai_addr, (int)res->ai_addrlen) < 0) {
+            close(fd_); fd_ = kInvalidSocket; freeaddrinfo(res); return false;
         }
         freeaddrinfo(res);
         return true;
     }
 
     void close_conn() {
-        if (fd_ >= 0) { close(fd_); fd_ = -1; }
+        if (fd_ != kInvalidSocket) { close(fd_); fd_ = kInvalidSocket; }
     }
 
     Response do_request(const std::string& req) {

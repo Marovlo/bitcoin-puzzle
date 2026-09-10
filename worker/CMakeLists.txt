@@ -28,6 +28,12 @@ if(USE_HIP)
     message(STATUS "HIP found")
 endif()
 
+# OpenCL support (optional). This is the portable GPU path: it needs no vendor
+# SDK because the kernel is compiled at runtime by the installed driver, and on
+# Windows/AMD it is the only option for pre-RDNA3 cards (AMD's HIP SDK for
+# Windows does not support RDNA2 and older).
+option(USE_OPENCL "Enable OpenCL support" OFF)
+
 # Sources
 set(WORKER_SOURCES main.cpp)
 
@@ -49,6 +55,22 @@ if(USE_HIP)
     if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
         set(CMAKE_HIP_ARCHITECTURES "gfx1030") # RX 6800 XT default
     endif()
+endif()
+
+if(USE_OPENCL)
+    list(APPEND WORKER_SOURCES kernels/opencl/opencl_solver.cpp)
+    # Embed the kernel source as a raw string literal, mirroring the Metal path.
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/kernels/opencl/puzzle_opencl_source.inc
+        COMMAND ${CMAKE_COMMAND}
+                -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/kernels/opencl/puzzle_kernel.cl
+                -DOUTPUT=${CMAKE_CURRENT_SOURCE_DIR}/kernels/opencl/puzzle_opencl_source.inc
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_opencl_kernel.cmake
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/opencl/puzzle_kernel.cl
+              ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_opencl_kernel.cmake
+        COMMENT "Embedding OpenCL kernel source"
+    )
+    list(APPEND WORKER_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/opencl/puzzle_opencl_source.inc)
 endif()
 
 if(USE_METAL)
@@ -98,6 +120,24 @@ endif()
 if(USE_HIP)
     target_compile_definitions(puzzle_worker PRIVATE USE_HIP)
     target_link_libraries(puzzle_worker hip::device)
+endif()
+
+if(USE_OPENCL)
+    target_compile_definitions(puzzle_worker PRIVATE USE_OPENCL)
+    # The vendored Khronos headers keep the build SDK-free; the ICD loader itself
+    # is whatever the graphics driver installed.
+    target_include_directories(puzzle_worker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/OpenCL)
+    find_package(OpenCL QUIET)
+    if(OpenCL_FOUND)
+        target_link_libraries(puzzle_worker OpenCL::OpenCL)
+    elseif(WIN32)
+        # No import library on a stock Windows install: link the ICD loader DLL
+        # directly, which ld resolves from its export table.
+        target_link_libraries(puzzle_worker "$ENV{SystemRoot}/System32/OpenCL.dll")
+    else()
+        target_link_libraries(puzzle_worker OpenCL)
+    endif()
 endif()
 
 # Optimization flags

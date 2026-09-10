@@ -10,7 +10,12 @@ worker 在各后端的优化进度、方法与踩过的坑。**所有性能数�
 | CPU (ARM, Mac) | ~18 MK/s | **46 MK/s** | 2.5x | M3 Pro 12 线程 |
 | CPU (ARM, Android) | 9 MK/s | **18 MK/s** | 2.0x | 小米15 / 骁龙8至尊版 8 线程（真机实测） |
 | CPU (x86) | 8.8 MK/s | **39 MK/s** | 4.5x | AMD EPYC Zen2 8 核 |
+| OpenCL | 43 MK/s | **652 MK/s** | 15.2x | RX 6800 XT (gfx1030/RDNA2) + 5700X，Windows |
 | CUDA | 未优化 | 未优化 | — | 算法落后一代，见 §3 |
+
+> OpenCL 一行的口径说明：baseline = `puzzle_search_naive`（把 CUDA/HIP kernel 原样移植过来），
+> 当前值来自 `--bench` 的 50M key 采样（此时还没有连公共池跑真实任务，故不是 per-task 数字）。
+> 同一台机器上 `--backend auto`（GPU+CPU）为 ~780 MK/s。
 
 ## 心法（先读这条）
 
@@ -27,7 +32,7 @@ worker 在各后端的优化进度、方法与踩过的坑。**所有性能数�
 
 ## 1.1 对称群加 C ± i·G + 批量共享求逆 ★核心
 
-**这是收益最大的优化，CPU/Metal 已验证，CUDA 待移植。**
+**这是收益最大的优化，CPU/Metal/OpenCL 已验证，CUDA 待移植。**
 
 **问题**：朴素实现 1 线程/key，每个 key 都做完整 `scalar_mul_g` + `mod_inv`，两者各占约一半开销。
 
@@ -42,14 +47,17 @@ worker 在各后端的优化进度、方法与踩过的坑。**所有性能数�
 
 **实测收益**：CPU 单线程 +118%；Metal 1.9x（83→158 MK/s，超出预估上限）。
 
-**参考实现**：`backend_cpu.h::search_incremental`（最干净、穷举验证过）；Metal 落地见 `kernels/puzzle.metal::puzzle_search` + `metal_solver.mm` 的 ig_table 构建。
+**参考实现**：`backend_cpu.h::search_incremental`（最干净、穷举验证过）；Metal 落地见 `kernels/puzzle.metal::puzzle_search` + `metal_solver.mm` 的 ig_table 构建；OpenCL 落地见 §2.6。
 
 ## 1.2 群大小 H 调参
 
 H 越大，求逆和 scalar_mul 摊得越薄；但每线程要存一组中间量，寄存器/栈压力上升，过大伤 occupancy。**典型 U 型曲线，需 sweep**：
 
 - Metal `GROUP_H` 扫描：64→158, 128→177, **256→180**, 512→124（越过拐点，~24KB/线程栈杀 occupancy）。M3 Pro 最优 256。
+- OpenCL (RX 6800 XT) `GROUP_H` 扫描：8→476, 16→623, **32→652** MK/s。RDNA2 每个 wave 只有 256 个 VGPR，`pre[H+1]` 前缀数组全在寄存器里，H=32 已接近上限（H=64 会是 33→65 个前缀，必然 spill），所以拐点比 Metal 来得早得多。
 - CPU 用 H=256。CUDA 寄存器更紧，预计要从 16/32/64 往上试。
+
+**每工作项处理多个 group（`GROUPS_PER_ITEM`）**：CPU 版用"跨组增量推进中心点"把首个 group 的 `scalar_mul_g` 摊薄。OpenCL 也这么做了（默认 8），但**不是越大越好**：8 → 652 MK/s，16 → 567 MK/s。kernel 变长会放大尾部负载不均，收益低于损失。
 
 ## 1.3 GPU 落地的关键适配（CUDA 移植必读）
 
@@ -57,7 +65,9 @@ H 越大，求逆和 scalar_mul 摊得越薄；但每线程要存一组中间量
 >
 > 历史教训：CUDA 上 `9e245bf` 曾试批量求逆，把 prefix/back-prop **全压给 `tid==0` + 全块 `__syncthreads()`**，occupancy 崩盘，被 `62f8211` 回退。Metal 现在"每线程一组、组内串行、零协作"的做法**恰好避开了这个坑**——这是正确姿势。代价是单线程寄存器压力大，用 H 调参平衡。
 >
-> 注：CPU 版有个"跨组增量推进中心点"的优化（`C += (2H+1)·G` 复用同批求逆），但 **GPU 版不需要**——每线程只处理一个 group，更简单，也没有"错误沿增量链传播"的风险。
+> 注：CPU 版有个"跨组增量推进中心点"的优化（`C += (2H+1)·G`，复用同一批求逆，每步只要 ~3 乘）。Metal 版每线程只处理一个 group，不需要它。
+>
+> OpenCL 版**用了**它——每个工作项串行处理 `GROUPS_PER_ITEM` 个 group，因为 RDNA2 上首个 group 的 `scalar_mul_g`（~350 乘）在 8 个 group 的总成本里仍约占 10%。配套的安全措施是**每个 group 都校验分母**：任一 `den[i]==0` 就整组走 fallback 并把 `centre_valid` 置 false，下一个 group 用完整 `scalar_mul_g` 重算中心，所以增量链**不会传播错误**。
 
 ---
 
@@ -146,9 +156,40 @@ U 型谷底在 GROUP×32~64。开销大头是**每 tile 重算一次中心点（
 | 对称群加 C±i·G（§1.1） | 158 | 10.9x | symgroup |
 | 调 GROUP_H → 256（§1.2） | **180** | **12.4x** | symgroup |
 
-主要靠 §1 的算法优化。Metal 专属的微调（fast-math、threadgroup 宽度）收益不明显——见 §2.5 负优化记录。代码：`kernels/puzzle.metal`、`metal_solver.mm`。
+主要靠 §1 的算法优化。Metal 专属的微调（fast-math、threadgroup 宽度）收益不明显——见 §2.6 负优化记录。代码：`kernels/puzzle.metal`、`metal_solver.mm`。
 
-## 2.5 已验证为负优化 / 无效（不要再试）
+## 2.5 OpenCL GPU（AMD / Windows）— 已落地 15.2x
+
+设备 RX 6800 XT（gfx1030，RDNA2）+ Ryzen 7 5700X，Windows 11，Adrenalin 32.0.21045.5002。
+
+**为什么是 OpenCL 而不是 HIP**：AMD 的 HIP SDK for Windows 官方只支持 RDNA3 及以上，gfx1030 被明确标为不支持（Linux 的 ROCm 支持它，但那是另一套环境）。OpenCL 反而是**零依赖**方案——runtime 随显卡驱动安装，kernel 由驱动在运行时编译，所以构建只需要一个宿主编译器，不需要任何 GPU SDK。
+
+| 阶段 | MK/s | 加速 | 说明 |
+|------|------|------|------|
+| 朴素 kernel（每 key 一次 scalar_mul + 一次 mod_inv） | 43 | 1.0x | 与 CUDA/HIP 同代算法 |
+| 移植 §1.1 对称群加，H=8 | 476 | 11.1x | |
+| `GROUP_H` → 16 | 623 | 14.5x | |
+| `GROUP_H` → 32（§1.2） | **652** | **15.2x** | 与 CPU 后端（63 MK/s）相比 10x |
+| `--backend auto`（GPU+CPU） | **780** | | 默认后端 |
+
+**落地要点：**
+
+- **地址空间**：OpenCL C 的指针默认是 `__private`，把 `__global` 的表项指针直接传给一个 `const ulong qx[4]` 参数会编译失败（换 OpenCL 2.0 的 generic 地址空间可绕过）。做法是先把表项**显式载入私有寄存器**再传参——同时也给了编译器一个干净的预取点。
+- **寄存器预算**：`pre[H+1]`（批量求逆的前缀积）必须全程驻留寄存器，否则掉进 scratch。H=32 时它是 33×4 个 ulong ≈ 264 字节/线程，已经吃满 RDNA2 的 VGPR 预算；这是 OpenCL 拐点（32）比 Metal（256）早这么多的原因。
+- **不物化 `inv[]`**：回代循环里边算 `inv[i]` 边立刻产出 `C±i·G` 并哈希，省掉一整组数组。
+- **派发开销是逐次计的**：批量从 1M 提到 16M，吞吐 261 → 467 MK/s。同时把匹配槽的复位改成**非阻塞**写（队列 in-order，天然有序），只保留最后那次阻塞读作为唯一同步点。
+  - **踩坑**：非阻塞写的源指针**不能指向栈上临时变量**——`search_batch` 返回后内存失效，驱动延迟拷贝时读到垃圾，匹配标志被写成非零，kernel 一进来就早退，表现为"全部找不到"。必须用生命周期足够长的持久缓冲区。
+- **`mul_hi64` 手写**：OpenCL 的 `mul_hi()` 只保证 32 位版高效，64×64→128 用四个 32 位部分积显式展开，让编译器直接映射到 `v_mul_lo_u32` / `v_mul_hi_u32`。
+
+**移植时真正踩到的 bug（不是性能问题，是正确性）**：RIPEMD-160 的**最终组合顺序**。规范是
+`h0=h1₀+C_L+D_R`、`h1=h2₀+D_L+E_R`…… 交错往下（左路的 A/B/C/D/E 与右路的 C/D/E/A/B 错开一位配对），
+而初始值顺序是 `h0…h4 = 67452301, EFCDAB89, 98BADCFE, 10325476, C3D2E1F0`。
+写成"顺序对齐"的版本不会报错，只会让输出**整体循环移位一个字**——EC 和 SHA-256 全对、h160 全错，很容易误判成椭圆曲线的问题。定位方法：把 kernel 的每个中间量（px/py/pz/ax/ay/pubkey/sha/h160）dump 出来与 CPU 逐段比对。
+
+代码：`kernels/opencl/puzzle_kernel.cl`（`puzzle_search_group`）、`kernels/opencl/opencl_solver.cpp`、`backend_opencl.h`。
+构建：`build_windows.ps1`（或 CMake `-DUSE_OPENCL=ON`），详见 [BUILD_WINDOWS.md](BUILD_WINDOWS.md)。
+
+## 2.6 已验证为负优化 / 无效（不要再试）
 
 - **dedicated mod_sqr**（对称项算一次加两次）：Metal 83 → **61 MK/s，负优化**。原因：进位传播需分支/可变循环，伤 GPU 直线流水；通用 `mod_mul(a,a)` 的无分支固定结构反而更快。**CPU/Metal 都直接用 `mod_mul(a,a)`，不单独实现 mod_sqr。** 注意 `opt1-modsqr` 分支上还有一份**有 bug** 的手写 mod_sqr（129-bit doubling 移位错误，verify 失败），更不要用。
 - **Metal threadgroup 宽度** 32/64/128/256：全部 ~81-83 MK/s，无差异。GPU 受 register/occupancy 限制，不是 threadgroup 调度限制。
@@ -176,7 +217,12 @@ U 型谷底在 GROUP×32~64。开销大头是**每 tile 重算一次中心点（
 
 **落地前必须先建安全网（当前缺失！）**：CUDA 目前**没有任何正确性测试**。改 kernel 前必须照 `test_metal_correctness.cpp` 写 `test_cuda_correctness`：已知 key 放 batch 内非零偏移（1/37/1000/65535/1M），要求精确私钥 + 无误报，尤其覆盖 puzzle1(k=1) 的 degenerate fallback。
 
-**建议顺序**：① 写 test_cuda_correctness（当前 1线程1key 版作 golden）→ ② 移植对称群加，每步过测试 → ③ sweep H → ④ sweep block size / launch_bounds → ⑤ 最后才碰 PTX 微调（dedicated mod_sqr 别试，见 §2.5）。
+**建议顺序**：① 写 test_cuda_correctness（当前 1线程1key 版作 golden）→ ② 移植对称群加，每步过测试 → ③ sweep H → ④ sweep block size / launch_bounds → ⑤ 最后才碰 PTX 微调（dedicated mod_sqr 别试，见 §2.6）。
+
+> OpenCL 版（§2.5）已经把这套移植完整走通了一遍，可以当作 CUDA 移植的**逐行参照**：
+> 相同的 group 结构、相同的中间量（`pre[]` 前缀积 + 回代边算边出点）、相同的 degenerate fallback 与
+> `centre_valid` 重置策略。CUDA 上可以直接对照 `puzzle_kernel.cl` 改写，只需换掉地址空间限定符与
+> `mul_hi64` 的写法（CUDA 有原生 `__umul64hi`）。
 
 ## 3.2 co-Z 加法（Meloni）—— 中优先级，与 §1.1 二选一
 
@@ -199,6 +245,7 @@ U 型谷底在 GROUP×32~64。开销大头是**每 tile 重算一次中心点（
 | `test_metal_correctness` | Metal 区间搜索（key 在非零偏移）+ degenerate + 无误报，9/9 | `make test-metal` |
 | `test_coverage` | CPU 群搜索逐偏移穷举，1872/0 | `make test-coverage` |
 | `test_correct` | CPU hash160 vs 已知 puzzle 真值 | `make test-correct` |
+| `test_opencl_correctness` | OpenCL 区间搜索：64 个偏移逐个精确命中（按 7 分块，覆盖批次边界）+ 跨 2^64 进位 + 2M key 真实派发 + 2 个反例，68/68 | `.\build_windows.ps1 -Test` |
 | `test_cuda_correctness` | **待写**（CUDA，见 §3.1） | — |
 | 全部 | | `make test` |
 
