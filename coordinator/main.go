@@ -10,6 +10,8 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -82,6 +84,24 @@ type SubmitResult struct {
 	KeyHex string `json:"key_hex,omitempty"`
 }
 
+// FoundRecord is one solved puzzle, handed to the monitor so it can alert the
+// operator immediately instead of waiting for the daily report.
+type FoundRecord struct {
+	PuzzleNum  int
+	KeyHex     string
+	WorkerID   string
+	ChunkIndex uint64
+	Address    string
+}
+
+// PendingFound is a recorded find whose alert email has not been confirmed yet.
+type PendingFound struct {
+	PuzzleNum int
+	KeyHex    string
+	WorkerID  string
+	FoundAt   string
+}
+
 type StatsResp struct {
 	PuzzleNum     int    `json:"puzzle_num"`
 	Address       string `json:"address"`
@@ -109,6 +129,17 @@ type Coordinator struct {
 	targetH160  string
 	startTime   time.Time
 
+	// puzzleStartTime is when the coordinator started working on the *current*
+	// puzzle. It resets on switchPuzzle, and is the correct baseline for the
+	// throughput/ETA in the daily report (process uptime is not).
+	puzzleStartTime time.Time
+
+	// foundCh carries found keys to the monitor. Buffered and written to
+	// non-blockingly: if the monitor is busy the record is simply not queued,
+	// because the row stays notified=0 in the database and the daily report
+	// picks it up as a backstop.
+	foundCh chan FoundRecord
+
 	// Concurrency: mutex protects the in-memory allocation state
 	mu       sync.Mutex
 	workers  map[string]time.Time // worker_id -> last_seen
@@ -135,12 +166,14 @@ func NewCoordinator(dbPath string, puzzles []PuzzleEntry, puzzleNum, chunkBits i
 	db.SetMaxIdleConns(2)
 
 	c := &Coordinator{
-		db:        db,
-		puzzles:   puzzles,
-		puzzleNum: puzzleNum,
-		chunkBits: chunkBits,
-		workers:   make(map[string]time.Time),
-		startTime: time.Now(),
+		db:              db,
+		puzzles:         puzzles,
+		puzzleNum:       puzzleNum,
+		chunkBits:       chunkBits,
+		workers:         make(map[string]time.Time),
+		startTime:       time.Now(),
+		puzzleStartTime: time.Now(),
+		foundCh:         make(chan FoundRecord, 64),
 	}
 
 	c.chunkSize = uint64(1) << uint(chunkBits)
@@ -153,7 +186,12 @@ func NewCoordinator(dbPath string, puzzles []PuzzleEntry, puzzleNum, chunkBits i
 	c.totalChunks = new(big.Int).Lsh(big.NewInt(1), uint(exp))
 
 	puzzle := puzzles[puzzleNum-1]
-	c.targetH160 = addressToH160Hex(puzzle.Addr)
+	h160, err := addressToH160Hex(puzzle.Addr)
+	if err != nil {
+		// Fail loudly rather than mining a target that can never be found.
+		return nil, fmt.Errorf("puzzle #%d: %w", puzzleNum, err)
+	}
+	c.targetH160 = h160
 
 	if err := c.initDB(); err != nil {
 		return nil, err
@@ -196,7 +234,19 @@ func (c *Coordinator) initDB() error {
 			found_at TEXT DEFAULT (datetime('now'))
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Migration for databases created before alert tracking existed. ADD COLUMN
+	// errors with "duplicate column name" once the column is present, which is
+	// the normal case on every start after the first - only that error is
+	// tolerated.
+	if _, err := c.db.Exec(`ALTER TABLE found_keys ADD COLUMN notified INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 func (c *Coordinator) prepareStmts() error {
@@ -329,13 +379,12 @@ func (c *Coordinator) allocateChunks(workerID string, count int) ([]Task, error)
 	return tasks, nil
 }
 
-func (c *Coordinator) completeTasks(workerID string, results []SubmitResult) (int, string) {
+func (c *Coordinator) completeTasks(workerID string, results []SubmitResult) (int, []FoundRecord) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.workers[workerID] = time.Now()
 	completed := 0
-	foundKey := ""
+	var found []FoundRecord
 
 	for _, r := range results {
 		// Get chunk_index from active task
@@ -351,13 +400,45 @@ func (c *Coordinator) completeTasks(workerID string, results []SubmitResult) (in
 		completed++
 
 		if r.Found && r.KeyHex != "" {
-			foundKey = r.KeyHex
-			c.db.Exec(`INSERT OR REPLACE INTO found_keys (puzzle_num, key_hex, worker_id) VALUES (?, ?, ?)`,
-				c.puzzleNum, r.KeyHex, workerID)
-			log.Printf("!!! KEY FOUND: puzzle #%d key=%s worker=%s", c.puzzleNum, r.KeyHex, workerID)
+			puzzleNum := c.puzzleNum
+			// notified stays 0 until the alert email is confirmed sent. The CASE
+			// keeps it 0 when a different key arrives for the same puzzle, but
+			// preserves it when a worker replays the same find (its submit
+			// response was lost, so the submit thread retried the batch).
+			c.db.Exec(`INSERT INTO found_keys (puzzle_num, key_hex, worker_id, notified)
+					VALUES (?, ?, ?, 0)
+					ON CONFLICT(puzzle_num) DO UPDATE SET
+						key_hex   = excluded.key_hex,
+						worker_id = excluded.worker_id,
+						notified  = CASE WHEN found_keys.key_hex = excluded.key_hex
+						                 THEN found_keys.notified ELSE 0 END`,
+				puzzleNum, r.KeyHex, workerID)
+			log.Printf("!!! KEY FOUND: puzzle #%d key=%s worker=%s chunk=%d",
+				puzzleNum, r.KeyHex, workerID, chunkIndex)
+			found = append(found, FoundRecord{
+				PuzzleNum:  puzzleNum,
+				KeyHex:     r.KeyHex,
+				WorkerID:   workerID,
+				ChunkIndex: chunkIndex,
+				Address:    c.puzzles[puzzleNum-1].Addr,
+			})
 		}
 	}
-	return completed, foundKey
+
+	c.mu.Unlock()
+
+	// Emitted after the lock is released: the monitor's handler writes to the
+	// database too, and an SMTP round trip must never run under the allocation
+	// mutex (it would stall every worker).
+	for _, rec := range found {
+		select {
+		case c.foundCh <- rec:
+		default:
+			log.Printf("[Coordinator] found-key queue full; the daily report will still carry puzzle #%d", rec.PuzzleNum)
+		}
+	}
+
+	return completed, found
 }
 
 func (c *Coordinator) reapLoop() {
@@ -369,9 +450,21 @@ func (c *Coordinator) reapLoop() {
 	}
 }
 
-// Switch to a new puzzle target. Called by monitor when current puzzle is solved.
-// Workers will get the new puzzle info on their next task fetch.
-func (c *Coordinator) switchPuzzle(newPuzzleNum int) {
+// Switch to a new puzzle target. Called by the monitor once the current puzzle
+// is solved. Workers pick up the new target on their next task fetch.
+//
+// The new address is validated before any state changes, so a malformed entry in
+// puzzles.json leaves the coordinator mining the old target instead of silently
+// pointing every worker at a hash160 that can never be hit.
+func (c *Coordinator) switchPuzzle(newPuzzleNum int) error {
+	if newPuzzleNum < 1 || newPuzzleNum > len(c.puzzles) {
+		return fmt.Errorf("puzzle #%d out of range (1..%d)", newPuzzleNum, len(c.puzzles))
+	}
+	targetH160, err := addressToH160Hex(c.puzzles[newPuzzleNum-1].Addr)
+	if err != nil {
+		return fmt.Errorf("puzzle #%d: %w", newPuzzleNum, err)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -393,13 +486,79 @@ func (c *Coordinator) switchPuzzle(newPuzzleNum int) {
 		exp = 0
 	}
 	c.totalChunks = new(big.Int).Lsh(big.NewInt(1), uint(exp))
-	c.targetH160 = addressToH160Hex(c.puzzles[newPuzzleNum-1].Addr)
+	c.targetH160 = targetH160
 	c.completedCount = 0
+	c.puzzleStartTime = time.Now()
 
-	// Reset done table for new puzzle (old data is no longer relevant)
+	// Reset done table for the new puzzle (old data is no longer relevant).
+	// found_keys is deliberately kept: rows for earlier puzzles stay, and any
+	// that were never alerted are still reported by the daily backstop.
 	c.db.Exec(`DELETE FROM done`)
 
-	log.Printf("[Switch] Now targeting puzzle #%d (%s)", newPuzzleNum, c.puzzles[newPuzzleNum-1].Addr)
+	log.Printf("[Switch] Now targeting puzzle #%d (%s) h160=%s",
+		newPuzzleNum, c.puzzles[newPuzzleNum-1].Addr, targetH160)
+	return nil
+}
+
+// ========== Found-key plumbing (consumed by the monitor) ==========
+
+// FoundEvents is the stream of fresh finds that the monitor alerts on.
+func (c *Coordinator) FoundEvents() <-chan FoundRecord { return c.foundCh }
+
+func (c *Coordinator) puzzleStartedAt() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.puzzleStartTime
+}
+
+func (c *Coordinator) foundKeyFor(puzzleNum int) string {
+	var key string
+	c.db.QueryRow(`SELECT key_hex FROM found_keys WHERE puzzle_num=?`, puzzleNum).Scan(&key)
+	return key
+}
+
+// foundKeyNotified reports whether the alert for this exact find has already
+// been confirmed as delivered.
+func (c *Coordinator) foundKeyNotified(puzzleNum int, keyHex string) bool {
+	var notified int
+	if err := c.db.QueryRow(`SELECT notified FROM found_keys WHERE puzzle_num=? AND key_hex=?`,
+		puzzleNum, keyHex).Scan(&notified); err != nil {
+		return false
+	}
+	return notified != 0
+}
+
+func (c *Coordinator) markFoundKeyNotified(puzzleNum int, keyHex string) {
+	if _, err := c.db.Exec(`UPDATE found_keys SET notified=1 WHERE puzzle_num=? AND key_hex=?`,
+		puzzleNum, keyHex); err != nil {
+		log.Printf("[Coordinator] Could not mark found key as notified: %v", err)
+	}
+}
+
+// unnotifiedFoundKeys lists every find whose alert has not been confirmed,
+// across all puzzles.
+//
+// Deliberately not filtered by the current puzzle: after an automatic switch
+// that filter would hide a key found moments before the switch, which is
+// exactly the case where the operator most needs to be told.
+func (c *Coordinator) unnotifiedFoundKeys() []PendingFound {
+	rows, err := c.db.Query(
+		`SELECT puzzle_num, key_hex, COALESCE(worker_id,''), COALESCE(found_at,'')
+		   FROM found_keys WHERE notified=0 ORDER BY puzzle_num`)
+	if err != nil {
+		log.Printf("[Coordinator] Could not read pending found keys: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var out []PendingFound
+	for rows.Next() {
+		var p PendingFound
+		if err := rows.Scan(&p.PuzzleNum, &p.KeyHex, &p.WorkerID, &p.FoundAt); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *Coordinator) getStats() StatsResp {
@@ -489,10 +648,10 @@ func (c *Coordinator) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", 400)
 		return
 	}
-	completed, foundKey := c.completeTasks(req.WorkerID, req.Results)
+	completed, found := c.completeTasks(req.WorkerID, req.Results)
 	resp := map[string]interface{}{"status": "ok", "completed": completed}
-	if foundKey != "" {
-		resp["found_key"] = foundKey
+	if len(found) > 0 {
+		resp["found_key"] = found[0].KeyHex
 	}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -504,16 +663,24 @@ func (c *Coordinator) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // ========== Helpers ==========
 
-func addressToH160Hex(addr string) string {
-	b58 := "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+// Base58 alphabet used by Bitcoin legacy addresses.
+const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+// addressToH160Hex decodes a legacy P2PKH address into its 20-byte hash160.
+//
+// The input is validated rather than decoded optimistically: a single typo in
+// puzzles.json would otherwise yield a plausible-looking target that no worker
+// can ever hit, and the pool would appear to run normally forever.
+func addressToH160Hex(addr string) (string, error) {
+	if len(addr) < 26 || len(addr) > 35 {
+		return "", fmt.Errorf("address %q has implausible length %d", addr, len(addr))
+	}
+
 	decoded := make([]byte, 25)
 	for _, c := range addr {
-		val := 0
-		for i, b := range b58 {
-			if b == c {
-				val = i
-				break
-			}
+		val := strings.IndexRune(base58Alphabet, c)
+		if val < 0 {
+			return "", fmt.Errorf("address %q contains non-base58 character %q", addr, c)
 		}
 		carry := val
 		for i := 24; i >= 0; i-- {
@@ -521,12 +688,21 @@ func addressToH160Hex(addr string) string {
 			decoded[i] = byte(carry % 256)
 			carry /= 256
 		}
+		if carry != 0 {
+			return "", fmt.Errorf("address %q does not fit in a 25-byte payload", addr)
+		}
 	}
-	h160 := ""
+
+	// This puzzle set only uses P2PKH (version byte 0x00, leading '1').
+	if decoded[0] != 0x00 {
+		return "", fmt.Errorf("address %q is not P2PKH (version byte 0x%02x)", addr, decoded[0])
+	}
+
+	h160 := make([]byte, 0, 40)
 	for i := 1; i <= 20; i++ {
-		h160 += fmt.Sprintf("%02x", decoded[i])
+		h160 = append(h160, fmt.Sprintf("%02x", decoded[i])...)
 	}
-	return h160
+	return string(h160), nil
 }
 
 // ========== Main ==========
@@ -585,12 +761,35 @@ func main() {
 	log.Printf("H160:    %s", coord.targetH160)
 	log.Printf("Listen:  :%s", port)
 
-	// Start puzzle monitor (auto-switch + daily email)
+	// Start puzzle monitor: immediate found-key alerts, the daily report, and
+	// the solved-detection + auto-switch loop.
 	emailTo := os.Getenv("EMAIL_TO")
 	if emailTo == "" {
 		emailTo = "359207423@qq.com"
 	}
-	monitor := NewPuzzleMonitor(coord, emailTo)
+
+	solveCheck := 10 * time.Minute
+	if v := os.Getenv("SOLVE_CHECK_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			solveCheck = time.Duration(n) * time.Minute
+		} else {
+			log.Printf("Ignoring invalid SOLVE_CHECK_MINUTES=%q", v)
+		}
+	}
+
+	reportAt := 9 * time.Hour
+	if v := os.Getenv("REPORT_AT_UTC"); v != "" {
+		d, err := parseClock(v)
+		if err != nil {
+			log.Fatalf("Invalid REPORT_AT_UTC: %v", err)
+		}
+		reportAt = d
+	}
+
+	log.Printf("Alerts: to %s | daily report %s UTC | solve check every %s",
+		emailTo, formatClock(reportAt), solveCheck)
+
+	monitor := NewPuzzleMonitor(coord, emailTo, solveCheck, reportAt)
 	monitor.Start()
 
 	log.Fatal(http.ListenAndServe(":"+port, nil))
