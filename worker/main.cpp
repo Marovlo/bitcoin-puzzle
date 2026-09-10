@@ -38,6 +38,18 @@
 #include <condition_variable>
 #include "platform.h"
 
+// Winsock needs WSAStartup before any socket call, and it must happen before
+// the HTTP client is used for the first time. On POSIX platform_init() is a
+// no-op, so forgetting to call it was invisible there and only showed up on
+// Windows as "every HTTP request fails" - which looks like the coordinator
+// being unreachable.
+namespace {
+struct PlatformGuard {
+    PlatformGuard() { platform_init(); }
+    ~PlatformGuard() { platform_cleanup(); }
+};
+} // namespace
+
 // ========== Thread-safe queue ==========
 
 template<typename T>
@@ -285,7 +297,16 @@ static void submit_thread_fn(const std::string& base_url, const std::string& wor
 // ========== Main ==========
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // The UCRT does not honour _IOLBF when stdout is a redirected file, so a
+    // long-running worker started with output to a log appears to produce
+    // nothing until it exits. Output is only a few lines per second, so going
+    // unbuffered costs nothing and makes the log live.
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0); // Line-buffered output (for nohup/redirect)
+#endif
+    PlatformGuard platform_guard;     // WSAStartup / WSACleanup on Windows
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
@@ -539,7 +560,12 @@ int main(int argc, char** argv) {
                  worker_id.c_str(), backend->name().c_str(), hname, (unsigned long long)rate);
         auto resp = http::post(coordinator_url + "/api/register", buf);
         if (!resp.ok()) {
-            printf("[!] Registration failed. Is coordinator at %s?\n", coordinator_url.c_str());
+            // status_code == 0 means the request never completed (no connection),
+            // which is a different problem from the coordinator rejecting it.
+            printf("[!] Registration failed at %s (http status %d%s)\n",
+                   coordinator_url.c_str(), resp.status_code,
+                   resp.status_code == 0 ? ": could not connect" : "");
+            if (!resp.body.empty()) printf("    body: %s\n", resp.body.c_str());
             return 1;
         }
     }
