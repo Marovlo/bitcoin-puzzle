@@ -50,6 +50,12 @@ struct PlatformGuard {
 };
 } // namespace
 
+// Per-chunk detail lines. Off by default: a healthy worker finishes a chunk
+// every second or two, so logging each one costs several MB of log per day to
+// say nothing that a periodic summary line does not. --verbose restores it for
+// debugging.
+static bool g_verbose = false;
+
 // ========== Thread-safe queue ==========
 
 template<typename T>
@@ -255,7 +261,7 @@ static void submit_thread_fn(const std::string& base_url, const std::string& wor
             auto resp = http::post(base_url + "/api/submit", json_str);
             if (resp.ok()) {
                 tasks_submitted.fetch_add(batch.size());
-                printf("  [submit] %zu tasks uploaded OK\n", batch.size());
+                if (g_verbose) printf("  [submit] %zu tasks uploaded OK\n", batch.size());
             } else {
                 printf("  [submit] FAILED (status=%d), will retry\n", resp.status_code);
                 // On failure, DON'T clear batch — retry on next loop
@@ -344,6 +350,8 @@ int main(int argc, char** argv) {
             list_devices = true;
         else if (strcmp(argv[i], "--bench") == 0)
             bench_only = true;
+        else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0)
+            g_verbose = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("  -u, --url URL          Coordinator URL (default: http://81.70.166.231:8080)\n");
@@ -353,6 +361,7 @@ int main(int argc, char** argv) {
             printf("      --metal-batch N    Metal keys per dispatch (default: 4000000)\n");
             printf("      --list-devices     List available GPU devices and exit\n");
             printf("      --bench            Benchmark backends and exit (no pool connection)\n");
+            printf("  -v, --verbose          Log every chunk instead of a per-minute summary\n");
             printf("  -t, --test             Run self-test and exit\n");
             printf("  -h, --help             Show help\n");
             return 0;
@@ -602,6 +611,11 @@ int main(int argc, char** argv) {
 
     uint64_t tasks_computed = 0;
     auto t_start = std::chrono::steady_clock::now();
+    // Progress reporting state: one summary line per minute rather than one per
+    // chunk (see g_verbose above).
+    auto last_report = t_start;
+    uint64_t keys_at_report = 0;
+    uint64_t tasks_at_report = 0;
 
     while (g_running) {
         ComputeTask ct;
@@ -633,11 +647,26 @@ int main(int argc, char** argv) {
         }
         result_queue.push(cr);
 
-        printf("  [%llu] chunk=%llu %.1fs %.1f MK/s q=%zu %s\n",
-               (unsigned long long)tasks_computed,
-               (unsigned long long)ct.chunk_index,
-               elapsed, mks, task_queue.size(),
-               found ? "*** FOUND ***" : "");
+        if (g_verbose) {
+            printf("  [%llu] chunk=%llu %.1fs %.1f MK/s q=%zu %s\n",
+                   (unsigned long long)tasks_computed,
+                   (unsigned long long)ct.chunk_index,
+                   elapsed, mks, task_queue.size(),
+                   found ? "*** FOUND ***" : "");
+        } else if (t1 - last_report >= std::chrono::seconds(60)) {
+            const double span = std::chrono::duration<double>(t1 - last_report).count();
+            const uint64_t keys_span = total_keys.load() - keys_at_report;
+            const double uptime = std::chrono::duration<double>(t1 - t_start).count();
+            printf("[progress] +%llu chunks | %.1f MK/s now, %.1f MK/s avg | %.1f Gkeys | q=%zu | up %.0fs\n",
+                   (unsigned long long)(tasks_computed - tasks_at_report),
+                   span > 0 ? keys_span / span / 1e6 : 0.0,
+                   uptime > 0 ? total_keys.load() / uptime / 1e6 : 0.0,
+                   total_keys.load() / 1e9,
+                   task_queue.size(), uptime);
+            last_report = t1;
+            keys_at_report = total_keys.load();
+            tasks_at_report = tasks_computed;
+        }
 
         if (found) {
             printf("\n!!! KEY FOUND: %s !!!\n", cr.key_hex.c_str());
