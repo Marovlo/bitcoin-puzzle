@@ -74,8 +74,8 @@ type GetBatchResp struct {
 }
 
 type SubmitReq struct {
-	WorkerID string           `json:"worker_id"`
-	Results  []SubmitResult   `json:"results"`
+	WorkerID string         `json:"worker_id"`
+	Results  []SubmitResult `json:"results"`
 }
 
 type SubmitResult struct {
@@ -141,8 +141,8 @@ type Coordinator struct {
 	foundCh chan FoundRecord
 
 	// Concurrency: mutex protects the in-memory allocation state
-	mu       sync.Mutex
-	workers  map[string]time.Time // worker_id -> last_seen
+	mu      sync.Mutex
+	workers map[string]time.Time // worker_id -> last_seen
 
 	// Atomic counters (avoid COUNT(*) scans)
 	completedCount uint64
