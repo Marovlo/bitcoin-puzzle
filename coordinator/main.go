@@ -233,6 +233,14 @@ func (c *Coordinator) initDB() error {
 			worker_id TEXT,
 			found_at TEXT DEFAULT (datetime('now'))
 		);
+
+		-- Small key/value store for alerting state that has to survive a restart
+		-- (last startup alert, which puzzle we already alerted about, a switch
+		-- target left pending by a failure).
+		CREATE TABLE IF NOT EXISTS meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 	`)
 	if err != nil {
 		return err
@@ -498,6 +506,35 @@ func (c *Coordinator) switchPuzzle(newPuzzleNum int) error {
 	log.Printf("[Switch] Now targeting puzzle #%d (%s) h160=%s",
 		newPuzzleNum, c.puzzles[newPuzzleNum-1].Addr, targetH160)
 	return nil
+}
+
+// ========== Alerting state that must outlive a restart ==========
+
+func (c *Coordinator) metaGet(key string) string {
+	var value string
+	c.db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&value)
+	return value
+}
+
+func (c *Coordinator) metaSet(key, value string) {
+	if _, err := c.db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+		log.Printf("[Coordinator] meta %s=%s write failed: %v", key, value, err)
+	}
+}
+
+func (c *Coordinator) metaGetInt(key string) int {
+	n, _ := strconv.Atoi(c.metaGet(key))
+	return n
+}
+
+// metaSetInt skips the write when the value is unchanged, so a polling loop can
+// call it every tick without touching the disk.
+func (c *Coordinator) metaSetInt(key string, value int) {
+	if c.metaGetInt(key) == value {
+		return
+	}
+	c.metaSet(key, strconv.Itoa(value))
 }
 
 // ========== Found-key plumbing (consumed by the monitor) ==========

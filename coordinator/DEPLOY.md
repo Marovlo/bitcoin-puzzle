@@ -63,17 +63,42 @@ CGO_ENABLED=1 go build -o puzzle_coordinator .
 - 通知走独立 goroutine，SMTP 阻塞不会卡住任务分配（分配路径的互斥锁内绝不发信）；
 - 网络查询失败一律按"未解出"处理，绝不误报解出；切换新 puzzle 前先校验地址，校验失败则保持原目标并告警。
 
+## 更新部署
+
+**生产环境由 systemd 托管，不要用 nohup 起第二个进程。**
+（曾经踩过：误以为没有 systemd 服务而用 nohup 启动，两个进程抢 8080，
+systemd 进入 `Restart=always` 每 5 秒重启一次的循环，每次启动都发一封告警邮件。）
+
+```bash
+# 判断服务是否已存在，用真实单元名，别猜
+systemctl status puzzle-coordinator     # 不是 puzzle-pool
+
+# 1. 备份数据库（对运行中的库安全）
+python3 -c "import sqlite3,sys; s=sqlite3.connect('file:puzzle_pool.db?mode=ro',uri=True); \
+d=sqlite3.connect('puzzle_pool.before-update.db'); s.backup(d); d.close(); s.close()"
+
+# 2. 取新代码并构建（构建失败时旧进程仍在运行）
+cd /root/bitcoin-puzzle && git fetch origin && git reset --hard origin/main
+cd coordinator && CGO_ENABLED=1 go build -o puzzle_coordinator.new . && \
+  mv puzzle_coordinator.new puzzle_coordinator
+
+# 3. 重启（systemd 会拉起新二进制）
+sudo systemctl restart puzzle-coordinator
+sudo systemctl status puzzle-coordinator --no-pager
+curl -s localhost:8080/api/stats
+```
+
+排查要点：
+
+- **确认只有一个进程**：`pgrep -af puzzle_coordinato[r]`，且 `ss -lntp | grep 8080` 的所有者就是它；
+- 日志里出现 `listen tcp :8080: bind: address already in use` 说明有另一个实例在抢端口；
+- `Restart=always` 意味着服务异常退出会自动重拉，所以**跑通的命令只能有一条路径**（要么 systemd，要么手工，不能并存）。
+
 ## 运行
 
 ```bash
-# 前台运行（测试）
+# 前台运行（仅本地测试，不要在生产的 8080 上执行）
 PUZZLE_NUM=71 PUZZLES_FILE=../puzzles.json ./puzzle_coordinator
-
-# 后台运行（生产）
-nohup env PUZZLE_NUM=71 PUZZLES_FILE=../puzzles.json PORT=8080 \
-  ./puzzle_coordinator > coordinator.log 2>&1 &
-
-# 或使用 systemd（推荐）
 ```
 
 ## Systemd 服务（推荐）
@@ -81,14 +106,15 @@ nohup env PUZZLE_NUM=71 PUZZLES_FILE=../puzzles.json PORT=8080 \
 实际部署使用 `puzzle-coordinator.service`，以下为当前生产配置：
 
 ```bash
+# 注意：这份是逐字对照生产环境的，不要凭记忆手写。
+sudo systemctl cat puzzle-coordinator    # 先看实际配置，再改
+
 sudo tee /etc/systemd/system/puzzle-coordinator.service << 'EOF'
 [Unit]
 Description=Bitcoin Puzzle Pool Coordinator
 After=network.target
 
 [Service]
-Type=simple
-User=root
 WorkingDirectory=/root/bitcoin-puzzle/coordinator
 Environment=SMTP_HOST=smtp.qq.com
 Environment=SMTP_PORT=587
@@ -98,6 +124,8 @@ Environment=EMAIL_TO=your_email@qq.com
 ExecStart=/root/bitcoin-puzzle/coordinator/puzzle_coordinator
 Restart=always
 RestartSec=5
+StandardOutput=append:/root/bitcoin-puzzle/coordinator/coordinator.log
+StandardError=append:/root/bitcoin-puzzle/coordinator/coordinator.log
 
 [Install]
 WantedBy=multi-user.target

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,7 +69,35 @@ func NewPuzzleMonitor(coord *Coordinator, emailTo string, solveCheckInterval tim
 }
 
 func (m *PuzzleMonitor) Start() {
-	stats := m.coord.getStats()
+	m.sendStartupAlert(m.coord.getStats())
+
+	go m.foundKeyLoop()
+	go m.solveLoop()
+	go m.dailyReportLoop()
+
+	log.Printf("[Monitor] Started: found-key alerts on submit, solve check every %s, daily report at %s UTC, email=%s",
+		m.solveCheckInterval, formatClock(m.reportAtUTC), m.emailTo)
+}
+
+// sendStartupAlert announces the process, at most once per startupAlertWindow.
+//
+// The throttle exists because of a real incident: when the service is stuck in a
+// restart loop (a port conflict, a crash on boot), one alert per attempt flooded
+// the operator's inbox and got the SMTP account rate limited. The timestamp is
+// recorded even when delivery fails, so what is bounded here is *attempts*, not
+// just successes.
+func (m *PuzzleMonitor) sendStartupAlert(stats StatsResp) {
+	const startupAlertWindow = 10 * time.Minute
+	const key = "last_startup_alert"
+
+	if last, err := strconv.ParseInt(m.coord.metaGet(key), 10, 64); err == nil && last > 0 {
+		if since := time.Since(time.Unix(last, 0)); since < startupAlertWindow {
+			log.Printf("[Monitor] startup alert suppressed (%s since the last one)", since.Round(time.Second))
+			return
+		}
+	}
+
+	m.coord.metaSet(key, strconv.FormatInt(time.Now().Unix(), 10))
 	m.sendEmail(
 		fmt.Sprintf("[Puzzle Pool] Coordinator started - targeting #%d", stats.PuzzleNum),
 		fmt.Sprintf(`Coordinator is online.
@@ -88,13 +117,6 @@ Alerting:
 			stats.PuzzleNum, stats.Address, stats.ChunkBits, stats.TotalChunks,
 			time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
 			formatClock(m.reportAtUTC), m.solveCheckInterval))
-
-	go m.foundKeyLoop()
-	go m.solveLoop()
-	go m.dailyReportLoop()
-
-	log.Printf("[Monitor] Started: found-key alerts on submit, solve check every %s, daily report at %s UTC, email=%s",
-		m.solveCheckInterval, formatClock(m.reportAtUTC), m.emailTo)
 }
 
 // ========== 1. Key found ==========
@@ -242,26 +264,86 @@ ETA:              %s
 
 // solveLoop polls the target address and, once it has been emptied, alerts the
 // operator and moves the pool to the next unsolved puzzle.
+//
+// Both pieces of state live in the meta table rather than in memory, so a
+// restart cannot lose them:
+//
+//	solved_alert_for       puzzle already reported, so restarting does not send a
+//	                       second "solved" mail for the same puzzle
+//	pending_switch_target  >0  = switch to retry
+//	                       -1  = scanned, nothing left to switch to
+//	                        0  = needs a scan
+//
+// Persisting the pending target also means a switch that failed just before a
+// restart is still retried afterwards instead of being forgotten.
 func (m *PuzzleMonitor) solveLoop() {
 	time.Sleep(30 * time.Second) // let the HTTP listener come up first
 
-	lastAlerted := 0 // puzzle number already reported as solved
-	retryTarget := 0 // switch target left over from a failed attempt
+	lastAlerted := m.coord.metaGetInt("solved_alert_for")
+	retryTarget := m.coord.metaGetInt("pending_switch_target")
 
 	for {
 		current := m.coord.puzzleNum
 		solved, remoteKey := m.isPuzzleSolved(current)
 
 		if solved {
-			if lastAlerted != current {
+			justAlerted := lastAlerted != current
+			if justAlerted {
 				lastAlerted = current
+				m.coord.metaSetInt("solved_alert_for", current)
 				log.Printf("[Monitor] Puzzle #%d SOLVED!", current)
+				// A different puzzle needs its own scan.
+				retryTarget = 0
+				m.coord.metaSetInt("pending_switch_target", 0)
+			}
 
-				retryTarget = m.findNextUnsolved(current + 1) // may be -1
-				keyLine := m.keyLineFor(current, remoteKey)
+			if retryTarget == 0 {
+				retryTarget = m.findNextUnsolved(current + 1) // >0 target, -1 none left
+				m.coord.metaSetInt("pending_switch_target", retryTarget)
+			}
 
-				switch {
-				case retryTarget <= 0:
+			keyLine := m.keyLineFor(current, remoteKey)
+
+			switch {
+			case retryTarget > 0:
+				if err := m.coord.switchPuzzle(retryTarget); err != nil {
+					log.Printf("[Monitor] Switch #%d -> #%d failed: %v", current, retryTarget, err)
+					if justAlerted {
+						m.sendEmail(
+							fmt.Sprintf("[Puzzle Pool] #%d solved - switch to #%d FAILED", current, retryTarget),
+							fmt.Sprintf(`Puzzle #%d has been solved, but switching to #%d failed:
+
+%v
+
+The coordinator is still targeting #%d. The switch is retried every %s and you
+will get another email if it succeeds.
+`, current, retryTarget, err, current, m.solveCheckInterval))
+					}
+					// retryTarget stays set; the next tick retries it.
+				} else {
+					log.Printf("[Monitor] Switched to #%d", retryTarget)
+					if justAlerted {
+						m.sendEmail(
+							fmt.Sprintf("[Puzzle Pool] #%d solved - now targeting #%d", current, retryTarget),
+							fmt.Sprintf(`Puzzle #%d has been solved.
+
+Key: %s
+
+Auto-switched to puzzle #%d (%s).
+Workers pick up the new target on their next task fetch.
+`, current, keyLine, retryTarget, m.coord.puzzles[retryTarget-1].Addr))
+					} else {
+						m.sendEmail(
+							fmt.Sprintf("[Puzzle Pool] now targeting #%d", retryTarget),
+							fmt.Sprintf("The delayed switch succeeded: the pool is now targeting puzzle #%d (%s).\n",
+								retryTarget, m.coord.puzzles[retryTarget-1].Addr))
+					}
+					retryTarget = 0
+					m.coord.metaSetInt("pending_switch_target", 0)
+				}
+
+			default: // retryTarget < 0: already scanned, nothing left to switch to
+				if justAlerted {
 					log.Printf("[Monitor] No unsolved puzzle after #%d", current)
 					m.sendEmail(
 						fmt.Sprintf("[Puzzle Pool] #%d solved - no unsolved puzzle left", current),
@@ -272,45 +354,6 @@ Key: %s
 The coordinator is still targeting #%d and no further automatic switch is
 possible. Point it at a new target manually (PUZZLE_NUM=... ) and restart.
 `, current, keyLine, current))
-
-				default:
-					if err := m.coord.switchPuzzle(retryTarget); err != nil {
-						log.Printf("[Monitor] Switch #%d -> #%d failed: %v", current, retryTarget, err)
-						m.sendEmail(
-							fmt.Sprintf("[Puzzle Pool] #%d solved - switch to #%d FAILED", current, retryTarget),
-							fmt.Sprintf(`Puzzle #%d has been solved, but switching to #%d failed:
-
-%v
-
-The coordinator is still targeting #%d. The switch is retried every %s and you
-will get another email if it succeeds.
-`, current, retryTarget, err, current, m.solveCheckInterval))
-						// Keep retryTarget set: the branch below retries silently.
-					} else {
-						log.Printf("[Monitor] Switched to #%d", retryTarget)
-						m.sendEmail(
-							fmt.Sprintf("[Puzzle Pool] #%d solved - now targeting #%d", current, retryTarget),
-							fmt.Sprintf(`Puzzle #%d has been solved.
-
-Key: %s
-
-Auto-switched to puzzle #%d (%s).
-Workers pick up the new target on their next task fetch.
-`, current, keyLine, retryTarget, m.coord.puzzles[retryTarget-1].Addr))
-						retryTarget = 0
-					}
-				}
-			} else if retryTarget > 0 {
-				// Silent retry of a switch that failed earlier; only email on success.
-				if err := m.coord.switchPuzzle(retryTarget); err == nil {
-					log.Printf("[Monitor] Retry succeeded, switched to #%d", retryTarget)
-					m.sendEmail(
-						fmt.Sprintf("[Puzzle Pool] now targeting #%d", retryTarget),
-						fmt.Sprintf("The delayed switch succeeded: the pool is now targeting puzzle #%d (%s).\n",
-							retryTarget, m.coord.puzzles[retryTarget-1].Addr))
-					retryTarget = 0
-				} else {
-					log.Printf("[Monitor] Retry switch to #%d failed: %v", retryTarget, err)
 				}
 			}
 		}
