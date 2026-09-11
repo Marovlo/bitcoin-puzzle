@@ -66,11 +66,14 @@ OpenCL:
 
 | 后端 | 速率 | 说明 |
 |------|------|------|
-| `--backend opencl` | **~645 MK/s** | 群搜索 kernel |
-| `--backend cpu` | ~63 MK/s | 16 线程 |
-| `--backend auto` | **~780 MK/s** | GPU + CPU 并行 |
+| `--backend opencl` | **~680 MK/s** | 群搜索 kernel，整机 CPU 占用约 2% |
+| `--backend cpu` | ~63 MK/s | 16 线程，整机 CPU 满载 |
+| `--backend auto` | ~590–716 MK/s | GPU + CPU 并行，长跑抖动较大 |
 
 作为对比，同一张卡上朴素实现（每 key 一次标量乘 + 一次求逆）只有 ~43 MK/s。
+
+> 长跑建议只用 GPU。`auto` 会额外占满 16 个 CPU 线程（约 110 W），但实测**长跑吞吐并不稳定优于 GPU-only**，
+> 所以在这台机器上 `--backend opencl` 是更合适的默认值。
 
 ## 用 CMake 构建（可选）
 
@@ -86,6 +89,73 @@ cmake --build build-cmake -j
 |---------|------|------|
 | `PUZZLE_OCL_BATCH` | 16000000 | 每次派发的 key 数。派发开销按次数计，批量太小会被驱动调用淹没 |
 | `PUZZLE_OCL_NAIVE` | 未设置 | 设为任意值则强制使用朴素 kernel，仅用于 A/B 对照 |
+
+## 功耗控制（AMD / OverDrive8）
+
+Windows 没有 GPU 功耗计数器（`Power Meter` 是电池的），而 Adrenalin 的功耗滑杆在不少 RX 6000
+AIB 卡上**范围只有 -6%..+15%**，最低也就到 ~235 W，达不到真正的低功耗目标。
+真正有效的杠杆是**限制 GFX 最高频率**——降频时驱动会把电压一起压到 881 mV，省电主要来自这里。
+
+`tools/amd_power.exe` 通过驱动的 ADL OverDrive8 接口读写这些项（与 Adrenalin 调校页滑杆同一条路），
+并用 PMLog 读出真实瓦数 / 温度 / 转速。
+
+```powershell
+.\tools\amd_power.exe info              # 能力位、各项可调范围、实时传感器
+.\tools\amd_power.exe watch 10          # 每秒采一次功耗/温度/转速
+.\tools\amd_power.exe set-clkmax 1100   # 限制最高频率 (MHz)
+.\tools\amd_power.exe set-power -6      # 功耗滑杆 (%)
+.\tools\amd_power.exe reset             # 恢复默认
+```
+
+RX 6800 XT 实测（worker 满载，`--backend opencl`，`ASIC_POWER` 单位为 W）：
+
+| GFX 频率上限 | 实际频率 | 功耗 | 算力 | 每瓦算力 |
+|---|---|---|---|---|
+| 默认 2519 | 2360 MHz | 244 W | 682 MK/s | 2.79 |
+| 2200 | 2165 MHz | 164 W | 595 MK/s | 3.63 |
+| **1900** | **1874 MHz** | **131 W** | **516 MK/s** | **3.94 ← 效率最高** |
+| 1600 | 1585 MHz | 120 W | 436 MK/s | 3.63 |
+| 1300 | 1284 MHz | 109 W | 355 MK/s | 3.26 |
+| **1100** | **1093 MHz** | **99 W** | **302 MK/s** | **3.05** |
+| 900 | 899 MHz | 91 W | 248 MK/s | 2.73 |
+| 700 | 699 MHz | 70 W | 193 MK/s | 2.75 |
+
+关于这张表：
+
+- **算力与实际频率严格线性**（约 0.276 MK/s 每 MHz），所有行都吻合，所以表里的算力不是估算值。
+- **功耗曲线很不线性**：2470 → 2170 MHz 一段掉了 85 W，因为电压从 1128 mV 掉到 950 mV；
+  到 1900 MHz 以下电压触到 881 mV 地板，之后功耗只随频率缓降。
+- **每瓦算力在 ~1900 MHz 最优（3.94）**。因为电压有地板，频率太低反而摊不平固定的电压成本。
+  所以「要省电」和「要效率」是两个不同的点：
+  - 只要功耗 ≤100 W → `set-clkmax 1100`（99 W，热点 62 °C，风扇约 975 rpm，有时直接停转）；
+  - 想要**最高每瓦算力** → `set-clkmax 1900`（131 W，516 MK/s，比默认省电 46% 而算力只掉 24%）。
+- 满载功耗地板约 70 W（700 MHz），再往下压收益很小。
+
+相比默认 2519 MHz：1100 MHz 下 **功耗 -59%、热点 -22 °C、风扇转速 -44%，算力 -56%**；40 秒采样内
+功耗稳定在 98–101 W，无漂移。
+
+### 让限制在重启后保持
+
+OverDrive8 设置属于运行时状态，**驱动重启后会回到默认**。开机自动应用（无需管理员权限）：
+把下面内容存为
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\amd-gpu-100w.vbs`：
+
+```vbs
+Set sh = CreateObject("WScript.Shell")
+sh.Run """<仓库路径>\worker\tools\amd_power.exe"" set-clkmax 1100", 0, False
+```
+
+第二个参数 `0` 表示隐藏窗口。删掉该文件即可取消。
+
+### 这张卡上其它可用的旋钮
+
+`amd_power.exe info` 会列出全部可调项及范围。除频率外还可用：
+
+- `OD_VOLTAGE`（881–1150 mV，电压上限）——在降频之外再压一档电压；
+- `FAN_CURVE_*`（风扇曲线）——用 `set k=v` 自定义更安静的曲线。
+
+能力位未置位、即**不可用**的有：`FAN_ACOUSTIC_LIMIT`（封顶转速）、`TEMPERATURE_FAN`（目标温度）、
+`GFX_VOLTAGE_LIMIT`、`TDC_LIMIT`。
 
 ## 常见问题
 
@@ -116,5 +186,5 @@ worker 连协调者是普通 HTTP。若开了系统代理，注意 `--url` 指�
 
 - 确认用的是群搜索 kernel：启动日志里 `kernel group (group 32+1 keys, 8 groups/item)`；
   显示 `kernel naive` 说明设置了 `PUZZLE_OCL_NAIVE`。
-- `--backend auto` 会把 GPU 和 CPU 一起用上，比单用 GPU 更快。
+- 若设置了 GFX 频率上限（见「功耗控制」），算力会按频率成比例下降，这是预期行为。
 - 其它 3D 应用（游戏、浏览器硬件加速、壁纸引擎）会抢占 GPU，关掉再测。

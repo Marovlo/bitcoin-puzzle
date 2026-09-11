@@ -11,7 +11,7 @@
 #   needed at all.
 #
 # Usage (from the worker/ directory):
-#   .\build_windows.ps1              # build puzzle_worker.exe + tests
+#   .\build_windows.ps1              # build puzzle_worker.exe + tests + tools
 #   .\build_windows.ps1 -Test        # build then run the correctness tests
 #   .\build_windows.ps1 -Clean       # remove build outputs
 
@@ -100,6 +100,24 @@ try {
     Build-Target 'puzzle_worker' @('main.cpp', 'kernels/opencl/opencl_solver.cpp')
     Build-Target 'test_correctness' @('test_correctness.cpp')
     Build-Target 'test_opencl_correctness' @('test_opencl_correctness.cpp', 'kernels/opencl/opencl_solver.cpp')
+
+    # ---- optional: AMD GPU power / clock tool --------------------------------
+    # Windows exposes no GPU power counter, and the Adrenalin power-limit slider
+    # on many RX 6000 AIB cards only reaches -6%. Capping the GFX clock through
+    # ADL's OverDrive8 interface is what actually holds a card to a wattage
+    # budget. Needs the ADL headers, which are vendored under third_party/ADL.
+    $adlHeader = Join-Path $root 'third_party\ADL\adl_sdk.h'
+    if (Test-Path $adlHeader) {
+        $toolOut = Join-Path $root 'tools\amd_power.exe'
+        New-Item -ItemType Directory -Force -Path (Join-Path $root 'tools') | Out-Null
+        Write-Host "`n>> tools/amd_power.exe (AMD GPU power / clock control)" -ForegroundColor Yellow
+        & $gxx -std=c++17 -O2 -DNDEBUG -DWIN32_LEAN_AND_MEAN -Ithird_party/ADL `
+            'tools/amd_power.cpp' -o $toolOut -static -lkernel32
+        if ($LASTEXITCODE -ne 0) { throw 'build failed: tools/amd_power' }
+        Write-Host "   ok -> $toolOut" -ForegroundColor Green
+    } else {
+        Write-Host "`n(skipping tools/amd_power: third_party/ADL headers not present)" -ForegroundColor DarkGray
+    }
 
     Write-Host "`nbuild complete: $outDir" -ForegroundColor Green
 

@@ -332,6 +332,8 @@ int main(int argc, char** argv) {
     bool bench_only = false;
     int cpu_threads = 0;        // 0 = auto
     uint64_t metal_batch = 0;   // 0 = default (4M)
+    int duty_pct = 100;         // 100 = flat out, no throttling
+    double duty_burst = 60.0;   // seconds of compute per duty cycle
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--url") == 0 || strcmp(argv[i], "-u") == 0) && i + 1 < argc)
@@ -350,6 +352,10 @@ int main(int argc, char** argv) {
             list_devices = true;
         else if (strcmp(argv[i], "--bench") == 0)
             bench_only = true;
+        else if (strcmp(argv[i], "--duty") == 0 && i + 1 < argc)
+            duty_pct = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--duty-burst") == 0 && i + 1 < argc)
+            duty_burst = atof(argv[++i]);
         else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0)
             g_verbose = true;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -361,12 +367,24 @@ int main(int argc, char** argv) {
             printf("      --metal-batch N    Metal keys per dispatch (default: 4000000)\n");
             printf("      --list-devices     List available GPU devices and exit\n");
             printf("      --bench            Benchmark backends and exit (no pool connection)\n");
+            printf("      --duty N           GPU duty cycle in %% (default: 100 = flat out)\n");
+            printf("                         Cuts power, heat and fan noise, but costs throughput\n");
+            printf("                         about one-for-one: it idles the GPU for part of each\n");
+            printf("                         cycle rather than making it more efficient. The\n");
+            printf("                         driver's power limit does strictly better (same\n");
+            printf("                         watts, ~half the throughput loss) - use this one\n");
+            printf("                         when you need it scripted, remote, or per-worker.\n");
+            printf("      --duty-burst S     Seconds of compute per duty cycle (default: 60)\n");
             printf("  -v, --verbose          Log every chunk instead of a per-minute summary\n");
             printf("  -t, --test             Run self-test and exit\n");
             printf("  -h, --help             Show help\n");
             return 0;
         }
     }
+
+    if (duty_pct < 1) duty_pct = 1;
+    if (duty_pct > 100) duty_pct = 100;
+    if (duty_burst < 1.0) duty_burst = 1.0;
 
     if (list_devices) {
         printf("=== Available GPU devices ===\n");
@@ -616,6 +634,7 @@ int main(int argc, char** argv) {
     auto last_report = t_start;
     uint64_t keys_at_report = 0;
     uint64_t tasks_at_report = 0;
+    double duty_accum = 0.0;   // compute seconds banked in the current cycle
 
     while (g_running) {
         ComputeTask ct;
@@ -657,12 +676,12 @@ int main(int argc, char** argv) {
             const double span = std::chrono::duration<double>(t1 - last_report).count();
             const uint64_t keys_span = total_keys.load() - keys_at_report;
             const double uptime = std::chrono::duration<double>(t1 - t_start).count();
-            printf("[progress] +%llu chunks | %.1f MK/s now, %.1f MK/s avg | %.1f Gkeys | q=%zu | up %.0fs\n",
+            printf("[progress] +%llu chunks | %.1f MK/s now, %.1f MK/s avg | %.1f Gkeys | q=%zu | up %.0fs | duty %d%%\n",
                    (unsigned long long)(tasks_computed - tasks_at_report),
                    span > 0 ? keys_span / span / 1e6 : 0.0,
                    uptime > 0 ? total_keys.load() / uptime / 1e6 : 0.0,
                    total_keys.load() / 1e9,
-                   task_queue.size(), uptime);
+                   task_queue.size(), uptime, duty_pct);
             last_report = t1;
             keys_at_report = total_keys.load();
             tasks_at_report = tasks_computed;
@@ -672,6 +691,28 @@ int main(int argc, char** argv) {
             printf("\n!!! KEY FOUND: %s !!!\n", cr.key_hex.c_str());
             g_running = false;
             break;
+        }
+
+        // ---- duty-cycle throttle ----
+        // Bank the compute time we just served; once a whole burst is used up,
+        // idle the GPU for the matching fraction of the cycle. Sleeping on the
+        // compute thread is deliberate: the fetch and submit threads keep
+        // running, so results stay in flight and the pool still sees us during
+        // the idle window.
+        //
+        // Note what this does and does not buy. It trades wall-clock time for
+        // watts almost one-for-one and, because the card still draws idle power
+        // during the gaps, it costs a few percent of energy per key. The
+        // driver's power limit reaches a lower voltage at a given clock, which
+        // is why it delivers the same power cut for roughly half the throughput
+        // loss - reach for that first and keep this for scripted/remote use.
+        if (duty_pct < 100) {
+            duty_accum += elapsed;
+            if (duty_accum >= duty_burst) {
+                const double idle_s = duty_burst * (100.0 - duty_pct) / duty_pct;
+                std::this_thread::sleep_for(std::chrono::duration<double>(idle_s));
+                duty_accum = 0.0;
+            }
         }
 
         // Auto-calibrate batch_count after first task
