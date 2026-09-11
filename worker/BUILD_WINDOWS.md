@@ -102,7 +102,7 @@ AIB 卡上**范围只有 -6%..+15%**，最低也就到 ~235 W，达不到真正�
 ```powershell
 .\tools\amd_power.exe info              # 能力位、各项可调范围、实时传感器
 .\tools\amd_power.exe watch 10          # 每秒采一次功耗/温度/转速
-.\tools\amd_power.exe set-clkmax 1100   # 限制最高频率 (MHz)
+.\tools\amd_power.exe set-clkmax 1900   # 限制最高频率 (MHz)
 .\tools\amd_power.exe set-power -6      # 功耗滑杆 (%)
 .\tools\amd_power.exe reset             # 恢复默认
 ```
@@ -125,24 +125,26 @@ RX 6800 XT 实测（worker 满载，`--backend opencl`，`ASIC_POWER` 单位为 
 - **算力与实际频率严格线性**（约 0.276 MK/s 每 MHz），所有行都吻合，所以表里的算力不是估算值。
 - **功耗曲线很不线性**：2470 → 2170 MHz 一段掉了 85 W，因为电压从 1128 mV 掉到 950 mV；
   到 1900 MHz 以下电压触到 881 mV 地板，之后功耗只随频率缓降。
-- **每瓦算力在 ~1900 MHz 最优（3.94）**。因为电压有地板，频率太低反而摊不平固定的电压成本。
-  所以「要省电」和「要效率」是两个不同的点：
-  - 只要功耗 ≤100 W → `set-clkmax 1100`（99 W，热点 62 °C，风扇约 975 rpm，有时直接停转）；
-  - 想要**最高每瓦算力** → `set-clkmax 1900`（131 W，516 MK/s，比默认省电 46% 而算力只掉 24%）。
+- **每瓦算力在 ~1900 MHz 最优（3.94）**。因为电压有地板，频率太低反而摊不平固定的电压成本，
+  所以「省电」和「效率」不是同一个点：
+  - **默认就用 `set-clkmax 1900`**（131 W，516 MK/s，热点 62–65 °C）——比默认省电 46% 而算力只掉 24%，
+    每瓦算力由 2.79 升到 3.94，是本表的效率最优点；
+  - 只有需要硬压到 100 W 以下时才用 `set-clkmax 1100`（99 W，302 MK/s，每瓦 3.05）：
+    为省这 32 W 要多付 41% 的算力，并不划算。
 - 满载功耗地板约 70 W（700 MHz），再往下压收益很小。
 
-相比默认 2519 MHz：1100 MHz 下 **功耗 -59%、热点 -22 °C、风扇转速 -44%，算力 -56%**；40 秒采样内
-功耗稳定在 98–101 W，无漂移。
+相比默认 2519 MHz：1900 MHz 下 **功耗 -46%、热点 -21 °C、算力 -24%，每瓦算力 +41%**；
+40 秒采样内功耗稳定无漂移。
 
 ### 让限制在重启后保持
 
 OverDrive8 设置属于运行时状态，**驱动重启后会回到默认**。开机自动应用（无需管理员权限）：
 把下面内容存为
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\amd-gpu-100w.vbs`：
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\amd-gpu-130w.vbs`：
 
 ```vbs
 Set sh = CreateObject("WScript.Shell")
-sh.Run """<仓库路径>\worker\tools\amd_power.exe"" set-clkmax 1100", 0, False
+sh.Run """<仓库路径>\worker\tools\amd_power.exe"" set-clkmax 1900", 0, False
 ```
 
 第二个参数 `0` 表示隐藏窗口。删掉该文件即可取消。
